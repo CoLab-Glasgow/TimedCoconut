@@ -4,7 +4,7 @@
 #include <math.h>
 
 
-#include "hw_de_avr.h"
+#include "../in/hw_de_avr.h"
 
 #ifdef WCET_ANNOTATE
 #  undef WCET_ANNOTATE
