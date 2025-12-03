@@ -1,11 +1,14 @@
-# Coconut tool 
-Coconut is a C++ software tool for specifying **object protocols** (typestates) and **statically validating** that your code follows them.
+# TimedCoconut  
+**A Timing-Aware Extension of the Coconut Typestate Tool**
 
-- Enforce valid state transitions at **compile time**
-- Integrates with **GCC’s middle-end** via **GIMPLE IR**
-- Supports **branching**, **recursion**, **aliasing**, **inheritance**
-- Includes **typestate visualisation**
-- Works well for **embedded systems** verification (pre-deployment)
+TimedCoconut expands the capabilities of the original **Coconut** typestate system for C++, adding mechanisms for expressing and verifying **time-related constraints** in addition to standard behavioural protocols. As a fork of Coconut, this project enables developers to specify not just which operations are allowed, but also how long these operations may take on a particular hardware platform.
+
+TimedCoconut evaluates programs against three central criteria:
+
+1. **Protocol correctness** — code must follow the state transitions defined by the typestate specification.
+2. **Temporal compliance** — each operation must complete within the timing window associated with its transition.
+3. **Architecture-aware validation** — timing checks are performed using platform-specific execution characteristics, ensuring that both order and timing requirements hold on the target device.
+
 
 ### Download C++ ###
 - On Windows, you can download it from [here.](https://docs.microsoft.com/en-us/cpp/build/vscpp-step-0-installation?view=msvc-170/ "Install C and C++ support in Visual Studio") 
