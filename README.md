@@ -19,24 +19,13 @@ TimedCoconut evaluates programs against three central criteria:
 
 
   
-### Download Coconut file from here to try it with docker and experiment 
 
-(https://doi.org/10.5281/zenodo.14478714)
-
-### Download Cocount ###
+### Download YimedCocount ###
 
 ```
-git clone https://github.com/CoLab-Glasgow/Coconut.git
+git clone https://github.com/CoLab-Glasgow/TimedCoconut 
 
 ```
-
-👉 For full setup and usage instructions, see [Documentation.md](Documentation.md).  
-
-#### Install Dependencies
-- Boost Library (Version 1.81.0):
-  ```shell
-  git clone --branch boost-1.81.0 --depth 1 https://github.com/boostorg/boost.git
-  ```
 
 
 ### Environment Options
@@ -45,22 +34,33 @@ You can run these commands and compile the project using:
 - **Cygwin**: Offers a POSIX-compatible environment for Windows. https://www.cygwin.com/install.html 
 
 
-### GCC and Related Tools
+### GCC and Related Tools (for Desktop)
 The project uses **GCC 13**, which includes:
 - `gcc-13` - GNU Compiler Collection (C Compiler)
 - `g++-13` - GNU Compiler Collection (C++ Compiler)
 - `gcc-13-plugin-dev` - Plugin Development Tools for GCC 13
 
-inside wsl or Cygwin
+
 
 ```shell
 sudo apt update
 sudo apt install -y gcc-13 g++-13 gcc-13-plugin-dev
 
 ```
+### The TimedCoconut currently supports two embedded devices:
+
+- **arm-none-eabi-g++ (10.3.1)** — for ARM Cortex-M and ARM7TDMI microcontrollers  
+- **avr-g++ (7.3.0)** — for 8-bit Atmel AVR devices (e.g., ATmega328P/32U4)  
+inside wsl or Cygwin
+
+```shell
+sudo apt update
+sudo apt install -y gcc-arm-none-eabi
+sudo apt install -y gcc-avr avr-libc gcc-7-plugin-dev
+```
 
 
-#### Build the Coconut Library
+#### Build the TimedCoconut Library For desktop
 1. **Navigate to the "Coconut" directory**:
    ```shell
    cd Coconut
