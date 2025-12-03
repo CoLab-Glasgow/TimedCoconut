@@ -1,6 +1,6 @@
 #include <cstdint>
 #include <cstdio>
-#include "../hw_de.h"
+#include "../in/hw_de.h"
 
 
 #include "../include/Typestate_Library/TypestateLibrary_stub.h"
