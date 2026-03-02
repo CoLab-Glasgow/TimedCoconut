@@ -3,7 +3,6 @@
 #include "tree.h"
 #include "tree-cfg.h"  
 #include "tree-cfg.h"      // label_to_block_fn, CASE_* accessors
-
 #include "gimple.h"
 #include "cp/cp-tree.h"
 #include "tree-pass.h"
@@ -57,9 +56,11 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
-
+// ADD: pragma support + small containers
+#include "c-family/c-pragma.h"
+#include <deque>
+#include <string>
  long depth_r =0;
-// Put near your includes, once.
 #include "tree.h"
 
 // Portable wrapper: works on GCC 7 (needs precision) and newer (no precision).
@@ -125,20 +126,26 @@ std::unordered_set<tree> class_member_vars;
 //std::unordered_map<tree, tree> alias_map ;
 std::unordered_map<tree, tree> global_alias_map;
 std::unordered_map<tree, std::unordered_set<tree>> alias_map;
+struct BranchRule {
+    std::string method;
+    int cond;   // True/False/Undefined as int
+    int next;
+};
+
+static std::map<int, std::vector<BranchRule>> Branch_Rules;
 
 
 static std::unordered_set<tree> g_recursive_fn_decls;
 
 // Which transitions are recursive (state self-loops)
 struct RecursiveTransitionInfo {
-    std::string method;   // function name, e.g. "AdjustActuators"
-    int state;            // state id where it self-loops
+    std::string method;   
+    int state;            
 };
 
-// Filled by validate_wcet_vs_timed_rules when it sees self-loops
 extern std::vector<RecursiveTransitionInfo> g_recursive_transitions;
 
-// Fixed recursion bounds per function (filled from main or config)
+// Fixed recursion bounds per function 
 extern std::unordered_map<std::string, int> g_recursion_bound_by_method;
 
 
@@ -161,7 +168,7 @@ static int last_finalized_if_else_id = -1;
 static int last_finalized_first_state = -1;
 
 static int g_cycle_n = -1;   // Cycle<N> -> N (e.g. 20)
-// --- Helpers to read class-template name and its template args
+//  Helpers to read class-template name and its template args
 static const char* class_template_name(tree ty) {
     if (!ty || TREE_CODE(ty) != RECORD_TYPE) return nullptr;
     tree td = TYPE_NAME(ty);
@@ -180,9 +187,11 @@ static tree class_template_args(tree ty) {
 // Per-edge timing info
 struct TimedInfo {
     long long period_ns  = 0;   // period
-    long long deadline_ns= 0;   // relative deadline
+    long long offest_ns=0; // offest
+    long long U_deadline_ns= 0;   // upper duratio (relative)
+    long long L_deadline_ns= 0;   // lower duration (relative)
     int criticality      = 0;   // enum integral value
-    long long jitter_ns  = 0;   // optional last param
+
 };
 
 // from_state -> [(method, next_state, timing)]
@@ -217,34 +226,42 @@ static bool parse_timeguard(tree tg, TimedInfo &ti) {
     const int n = TREE_VEC_LENGTH(args);
     if (n < 4) return false;
 
-    long long  p=0, d=0, c=0, j=0;
+    long long  p=0, d=0, c=0, j=0 , ld=0;
     tree a0 = TREE_VEC_ELT(args,0);
     tree a1 = TREE_VEC_ELT(args,1);
     tree a2 = TREE_VEC_ELT(args,2);
     tree a3 = TREE_VEC_ELT(args,3);
-    tree a4 = (n >= 5 ? TREE_VEC_ELT(args,4) : nullptr);
+    tree a4 = TREE_VEC_ELT(args,4); 
+   // tree a4 = (n >= 5 ? TREE_VEC_ELT(args,4) : nullptr);
 
     as_sll(a0, p);
-    as_sll(a1, d);
+    as_sll(a2,ld);
+    as_sll(a3, d);
    // as_sll(a2, c);
-    if (a4) as_sll(a4, j);
+    //if (a4) as_sll(a4, j);
 
    
-    if (TREE_CODE(a2) == INTEGER_CST) {
-        c = (int)TREE_INT_CST_LOW(a2);
-    } else if (TREE_CODE(a2) == CONST_DECL) {
-        tree v = DECL_INITIAL(a2);
+    if (TREE_CODE(a4) == INTEGER_CST) {
+        c = (int)TREE_INT_CST_LOW(a4 );
+    } else if (TREE_CODE(a4) == CONST_DECL) {
+        tree v = DECL_INITIAL(a4);
         if (v && TREE_CODE(v) == INTEGER_CST) c = (int)TREE_INT_CST_LOW(v);
     }
 
   
     ti.period_ns   = p;
-    ti.deadline_ns = d;
+    ti.U_deadline_ns = d;
+    ti.L_deadline_ns = ld;
     ti.criticality = c;
-    ti.jitter_ns   = j;
+//    ti.jitter_ns   = j;
     return true;
 }
 
+
+static inline std::string unqualified_name(const std::string& demangled) {
+    auto pos = demangled.rfind("::");
+    return (pos == std::string::npos) ? demangled : demangled.substr(pos + 2);
+}
 
 // Timed_State<STATE, &Class::method, C<>, TimeGuard<...>, NEXT>
 
@@ -316,24 +333,22 @@ static void print_timed_typestate_rules() {
             const TimedInfo &ti = std::get<2>(edge);
 
             printf("  --[%s]--> %d\n", method.c_str(), to);
-            printf("     Timing: Period=%lld, Deadline=%lld, offest=%lld, Criticality=%d\n",
-                   ti.period_ns, ti.deadline_ns, ti.jitter_ns, ti.criticality);
+            printf("     Timing: Period=%lld, Offest=%lld, L_deadline=%lld, Upper_deadline=%lld, Criticality=%d\n",
+                   ti.period_ns, ti.offest_ns, ti.L_deadline_ns, ti.U_deadline_ns, ti.criticality);
+        }
+    }
+
+    
+    printf("Branch Rules\n");
+    for (const auto& [from, rules] : Branch_Rules) {        
+        printf("From state %d:\n", from);
+        for (const auto& rule : rules) {
+            printf("  --[%s, cond=%d]--> %d\n", rule.method.c_str(), rule.cond, rule.next);
         }
     }
 
     
 }
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -467,10 +482,7 @@ static inline tree canon_type(tree t) {
 }
 
 
-// ADD: pragma support + small containers
-#include "c-family/c-pragma.h"
-#include <deque>
-#include <string>
+
 static std::deque<std::string> g_wcet_pending;
 
 static inline bool is_fn_definition(tree fndecl){
@@ -499,7 +511,7 @@ static std::string qualified_name_for_decl(tree fndecl){
     return name;
 }
 
-// Parse fields out of the payload string (simple, tolerant)
+// Parse fields out of the payload string 
 struct AnnotRow {
     std::string qualified, file, method;
     int line = 0;
@@ -530,7 +542,7 @@ static std::vector<AnnotRow> g_rows;
 static std::unordered_map<const void*, std::unordered_map<std::string, double>> g_annot_wcet_ms; // class -> method -> ms
 static std::vector<AnnotRow> g_annot_rows; // for printing a list
 
-// ADD if not present
+
 #include <cmath>
 
 static inline const void* canon_key_from_record(tree t){
@@ -570,6 +582,8 @@ static void record_wcet_row(const void* class_key_canon_in,
     // Optional debug
    //  fprintf(stderr, "[wcet] attached %.6f ms to %s\n", ms, row.qualified.c_str());
 }
+
+
 
 
 // Parse "wcet_ms_exact=..." out of the payload string
@@ -643,7 +657,7 @@ static void wcet_on_finish_decl_wcet(void* data, void* /*user*/) {
        tree decl = static_cast<tree>(data);
     if (!decl) return;
 
-    // 1) If this is our marker: VAR_DECL in section ".wcet_next" with STRING_CST init
+    // 1)  ".wcet_next" with STRING_CST init
     if (TREE_CODE(decl)==VAR_DECL) {
         const char* sec = DECL_SECTION_NAME(decl);
         if (sec && strcmp(sec, ".wcet_next")==0) {
@@ -651,7 +665,7 @@ static void wcet_on_finish_decl_wcet(void* data, void* /*user*/) {
             if (init && TREE_CODE(init)==STRING_CST) {
                 const char* s = TREE_STRING_POINTER(init);
                 g_wcet_pending.emplace_back(s);
-                fprintf(stderr, "[wcet] marker queued: \"%s\"\n", s);
+              //  fprintf(stderr, "[wcet] marker queued: \"%s\"\n", s);
             }
             return; // nothing else to do for VAR_DECL
         }
@@ -679,7 +693,7 @@ static void wcet_on_finish_decl_wcet(void* data, void* /*user*/) {
         row.line = LOCATION_LINE(loc);
         row.method = DECL_NAME(decl) ? IDENTIFIER_POINTER(DECL_NAME(decl)) : "";
 
-        // store/print (you probably already have a vector; reuse it)
+        
  //   std::vector<AnnotRow> g_rows; // or keep it file-static if you prefer
         g_rows.push_back(row);
 
@@ -790,7 +804,7 @@ static void harvest_annot_from_decl(tree fndecl) {
         if (ret_type && harvest_one_attr_list(TYPE_ATTRIBUTES(ret_type), class_key, method, fndecl)) return;
     }
 
-    // 🔴 4) attributes on the *member declaration* inside the class
+    //  4) attributes on the *member declaration* inside the class
     if (class_type) {
         if (harvest_from_class_declaration(class_type, method, class_key, fndecl)) return;
     }
@@ -806,72 +820,487 @@ static void harvest_annot_from_decl(tree fndecl) {
 
 
 
-// ----------------------------------------------------------------------
-// Main function: process_typestate_template_pack
-// template<typename C, typename TFirst, typename... TRest>
-// ----------------------------------------------------------------------
-static void process_typestate_template_pack(tree ts_args_vec)
-{
-    if (!ts_args_vec || TREE_CODE(ts_args_vec) != TREE_VEC)
-        return;
 
-    const int N = TREE_VEC_LENGTH(ts_args_vec);
-    if (N == 0)
-        return;
+static tree peel_tree(tree t) {
+    while (t) {
+        enum tree_code c = TREE_CODE(t);
+        if (c == NOP_EXPR || c == CONVERT_EXPR || c == NON_LVALUE_EXPR) {
+            t = TREE_OPERAND(t, 0);
+            continue;
+        }
+        break;
+    }
+    return t;
+}
 
-    // ------------------------------------------------------------------
-    // 1. First template argument is the cycle type: C = Cycle<...>
-    // ------------------------------------------------------------------
-    tree cycle_ty = TREE_VEC_ELT(ts_args_vec, 0);
+static const char* safe_ident_ptr(tree id) {
+    return (id && TREE_CODE(id) == IDENTIFIER_NODE) ? IDENTIFIER_POINTER(id) : NULL;
+}
 
-    if (TYPE_P(cycle_ty) && TREE_CODE(cycle_ty) == RECORD_TYPE) {
-        // Extract Cycle<N>’s integer template argument, if present
-        tree cycle_args = class_template_args(cycle_ty);
-        if (cycle_args && TREE_CODE(cycle_args) == TREE_VEC &&
-            TREE_VEC_LENGTH(cycle_args) >= 1)
-        {
-            tree n = TREE_VEC_ELT(cycle_args, 0);
-            if (n && TREE_CODE(n) == INTEGER_CST) {
-                HOST_WIDE_INT val = TREE_INT_CST_LOW(n);
-                g_cycle_n = (int) val;
+// Works whether TYPE_NAME is TYPE_DECL or IDENTIFIER_NODE.
+static const char* type_base_name(tree ty) {
+    if (!ty) return NULL;
+    tree n = TYPE_NAME(ty);
+    if (!n) return NULL;
 
-                // <<< the only print you asked for >>>
-               // fprintf(stderr, "Cycle<N> = %d\n", g_cycle_n);
+    if (TREE_CODE(n) == TYPE_DECL) {
+        tree dn = DECL_NAME(n);
+        return dn ? IDENTIFIER_POINTER(dn) : NULL;
+    }
+    if (TREE_CODE(n) == IDENTIFIER_NODE) {
+        return IDENTIFIER_POINTER(n);
+    }
+    return NULL;
+}
+
+// INTEGER_CST or enum const CONST_DECL -> DECL_INITIAL -> INTEGER_CST
+static bool get_int_cst_value(tree t, int *out) {
+    if (!out) return false;
+    t = peel_tree(t);
+    if (!t) return false;
+
+    if (TREE_CODE(t) == INTEGER_CST) {
+        *out = (int)TREE_INT_CST_LOW(t);
+        return true;
+    }
+
+    if (TREE_CODE(t) == CONST_DECL) {
+        tree init = peel_tree(DECL_INITIAL(t));
+        if (init && TREE_CODE(init) == INTEGER_CST) {
+            *out = (int)TREE_INT_CST_LOW(init);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// Robustly extract member function name from template arg:
+// handles PTRMEM_CST, ADDR_EXPR(PTRMEM_CST...), OVERLOAD, BASELINK.
+static const char* extract_method_name(tree t) {
+    t = peel_tree(t);
+    if (!t) return "unknown";
+
+    if (TREE_CODE(t) == ADDR_EXPR) {
+        t = peel_tree(TREE_OPERAND(t, 0));
+        if (!t) return "unknown";
+    }
+
+    if (TREE_CODE(t) == PTRMEM_CST) {
+        tree mem = peel_tree(PTRMEM_CST_MEMBER(t));
+        if (!mem) return "unknown";
+
+        if (TREE_CODE(mem) == FUNCTION_DECL) {
+            tree dn = DECL_NAME(mem);
+            return dn ? IDENTIFIER_POINTER(dn) : "unknown";
+        }
+
+        if (TREE_CODE(mem) == OVERLOAD) {
+            tree fn = OVL_FUNCTION(mem); // first overload candidate
+            if (fn && TREE_CODE(fn) == FUNCTION_DECL) {
+                tree dn = DECL_NAME(fn);
+                return dn ? IDENTIFIER_POINTER(dn) : "unknown";
+            }
+        }
+
+        if (TREE_CODE(mem) == BASELINK) {
+            tree fns = BASELINK_FUNCTIONS(mem);
+            if (fns && TREE_CODE(fns) == OVERLOAD) {
+                tree fn = OVL_FUNCTION(fns);
+                if (fn && TREE_CODE(fn) == FUNCTION_DECL) {
+                    tree dn = DECL_NAME(fn);
+                    return dn ? IDENTIFIER_POINTER(dn) : "unknown";
+                }
             }
         }
     }
 
-    // ------------------------------------------------------------------
-    // 2. Remaining template arguments are TFirst, TRest... (states)
-    // ------------------------------------------------------------------
-    for (int i = 1; i < N; ++i) {   // start at 1, skip C
-        tree arg_ty = TREE_VEC_ELT(ts_args_vec, i);
+    return "unknown";
+}
 
-        // Each element is itself a class template instantiation: State<...> or Timed_State<...>
-        if (!TYPE_P(arg_ty) || TREE_CODE(arg_ty) != RECORD_TYPE)
-            continue;
 
-        // Get inner template arguments of this element
+static const int MERGED_BRANCH_STATE = -1;
+
+static void ensure_merged_rule(int from_st, const char* mn) {
+    auto &vec = Typestate_Rules[from_st];
+    for (auto &p : vec) {
+        if (p.first == mn && p.second == MERGED_BRANCH_STATE) return;
+    }
+    vec.push_back({mn, MERGED_BRANCH_STATE});
+}
+
+static void record_branch_rule(int from_st, const char* m_name, int cond, int next) {
+    const std::string mn = (m_name ? m_name : "unknown");
+
+    // Store option-specific rule ONLY here
+    Branch_Rules[from_st].push_back({mn, cond, next});
+
+   // fprintf(stderr, "[Coconut] BRANCH rule saved: %d --(%s, cond=%d)--> %d\n",
+          //  from_st, mn.c_str(), cond, next);
+   // fflush(stderr);
+}
+
+
+
+static std::vector<int> branch_all_next(int src, const std::string& method) {
+    std::vector<int> out;
+    std::unordered_set<int> seen;
+
+    const std::string uq = unqualified_name(method);
+    auto itB = Branch_Rules.find(src);
+    if (itB == Branch_Rules.end()) return out;
+
+    for (const auto& br : itB->second) {
+        bool name_match = (br.method == method) || (br.method == uq);
+        if (!name_match) continue;
+        if (!seen.count(br.next)) { seen.insert(br.next); out.push_back(br.next); }
+    }
+    return out;
+}
+
+static int branch_next_for_cond(int src, const std::string& method, int cond_val) {
+    const std::string uq = unqualified_name(method);
+
+    auto itB = Branch_Rules.find(src);
+    if (itB == Branch_Rules.end()) return -1;
+
+    for (const auto& br : itB->second) {
+        bool name_match = (br.method == method) || (br.method == uq);
+        if (!name_match) continue;
+        if (br.cond == cond_val) return br.next;
+    }
+    return -1;
+}
+
+static tree strip_nops(tree t) {
+    while (t && (TREE_CODE(t) == NOP_EXPR ||
+                 TREE_CODE(t) == CONVERT_EXPR ||
+                 TREE_CODE(t) == VIEW_CONVERT_EXPR)) {
+        t = TREE_OPERAND(t, 0);
+    }
+    return t;
+}
+
+static bool get_const_int(tree t, int &K) {
+    t = strip_nops(t);
+    if (!t) return false;
+
+    if (TREE_CODE(t) == INTEGER_CST) {
+        K = (int) tree_to_shwi(t);
+        return true;
+    }
+
+    // enum constant: CONST_DECL with DECL_INITIAL as INTEGER_CST
+    if (TREE_CODE(t) == CONST_DECL) {
+        tree init = strip_nops(DECL_INITIAL(t));
+        if (init && TREE_CODE(init) == INTEGER_CST) {
+            K = (int) tree_to_shwi(init);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+
+
+
+static void process_choice_list_type(tree choice_list_ty,
+                                     int from_st,
+                                     const char* method_name)
+{
+    if (!choice_list_ty || !TYPE_P(choice_list_ty)) return;
+
+    choice_list_ty = TYPE_MAIN_VARIANT(choice_list_ty);
+
+    // ChoiceList<Choices...> template args
+    tree choices = class_template_args(choice_list_ty);
+
+    // Unwrap cases:
+    //  (A) choices is TYPE_ARGUMENT_PACK directly
+    if (choices && TREE_CODE(choices) == TYPE_ARGUMENT_PACK) {
+        choices = ARGUMENT_PACK_ARGS(choices);
+    }
+
+    //  (B) choices is TREE_VEC with one element: TYPE_ARGUMENT_PACK
+    if (choices && TREE_CODE(choices) == TREE_VEC && TREE_VEC_LENGTH(choices) == 1) {
+        tree only = TREE_VEC_ELT(choices, 0);
+        if (only && TREE_CODE(only) == TYPE_ARGUMENT_PACK) {
+            choices = ARGUMENT_PACK_ARGS(only);
+        }
+    }
+
+    if (!choices || TREE_CODE(choices) != TREE_VEC) {
+   //     fprintf(stderr, "[Coconut] ChoiceList: could not expand choices\n");
+      //  fflush(stderr);
+        return;
+    }
+
+    const int C = TREE_VEC_LENGTH(choices);
+  //  fprintf(stderr, "[Coconut] ChoiceList expanded choices=%d (from=%d method=%s)\n",
+        //    C, from_st, method_name ? method_name : "unknown");
+   // fflush(stderr);
+
+    for (int j = 0; j < C; ++j) {
+        tree choice_item = TREE_VEC_ELT(choices, j);
+        if (!choice_item) continue;
+
+        if (PACK_EXPANSION_P(choice_item))
+            choice_item = PACK_EXPANSION_PATTERN(choice_item);
+
+        if (!choice_item || !TYPE_P(choice_item)) continue;
+
+        choice_item = TYPE_MAIN_VARIANT(choice_item);
+
+        // Choice<Cond, Next>
+        tree c_args = class_template_args(choice_item);
+        if (!c_args || TREE_CODE(c_args) != TREE_VEC || TREE_VEC_LENGTH(c_args) < 2) continue;
+
+        int cond, next;
+if (!get_int_cst_value(TREE_VEC_ELT(c_args, 0), &cond)) continue;
+if (!get_int_cst_value(TREE_VEC_ELT(c_args, 1), &next)) continue;
+
+
+        // STORE rule
+        record_branch_rule(from_st, method_name ? method_name : "unknown", cond, next);
+
+      //  fprintf(stderr, "  [Branch Rule] %d --(%s)--> if %d goto %d\n",
+       //         from_st, method_name ? method_name : "unknown", cond, next);
+      //  fflush(stderr);
+    }
+}
+
+// Optional: prints a short description of a tree node without dumping everything
+static void dbg_tree_short(const char* tag, tree t) {
+    fprintf(stderr, "[Coconut][DBG] %s: %s\n", tag, t ? get_tree_code_name(TREE_CODE(t)) : "NULL");
+    fflush(stderr);
+}
+
+
+static bool apply_branch_if_exists(int &cur_state, const std::string &method) {
+    auto it = Branch_Rules.find(cur_state);
+    if (it == Branch_Rules.end()) return false;
+
+    for (const auto &r : it->second) {
+        if (r.method == method) {
+        
+            int picked_cond = r.cond;
+            int picked_next = r.next;
+
+            fprintf(stderr,
+                    "[Coconut] BRANCH MERGE: state %d method '%s' -> picked (cond=%d) next=%d\n",
+                    cur_state, method.c_str(), picked_cond, picked_next);
+
+            cur_state = picked_next;
+            return true;
+        }
+    }
+    return false;
+}
+
+//
+
+/* this function processes the template arguments of State, Branch_State, and Timed_Branch_State to extract typestate rules and branch rules. 
+It handles both regular and parameter pack expansions. For Branch_State and Timed_Branch_State, it also extracts the method name and processes 
+the ChoiceList type to record branch rules. */
+
+static void process_typestate_template_pack(tree ts_args_vec) {
+    if (!ts_args_vec || TREE_CODE(ts_args_vec) != TREE_VEC) return;
+    const int N = TREE_VEC_LENGTH(ts_args_vec);
+    if (N <= 0) return;
+
+    auto peel = [&](tree t) -> tree {
+        while (t) {
+            enum tree_code c = TREE_CODE(t);
+            if (c == NOP_EXPR || c == CONVERT_EXPR || c == NON_LVALUE_EXPR) {
+                t = TREE_OPERAND(t, 0);
+                continue;
+            }
+            break;
+        }
+        return t;
+    };
+
+    auto type_name_cstr = [&](tree ty) -> const char* {
+        if (!ty || !TYPE_P(ty)) return NULL;
+        tree n = TYPE_NAME(ty);
+        if (!n) return NULL;
+        if (TREE_CODE(n) == TYPE_DECL) {
+            tree dn = DECL_NAME(n);
+            return dn ? IDENTIFIER_POINTER(dn) : NULL;
+        }
+        if (TREE_CODE(n) == IDENTIFIER_NODE) {
+            return IDENTIFIER_POINTER(n);
+        }
+        return NULL;
+    };
+
+    auto get_int = [&](tree t, int* out) -> bool {
+        if (!out) return false;
+        t = peel(t);
+        if (!t) return false;
+
+        if (TREE_CODE(t) == INTEGER_CST) {
+            *out = (int)TREE_INT_CST_LOW(t);
+            return true;
+        }
+        if (TREE_CODE(t) == CONST_DECL) {
+            tree init = peel(DECL_INITIAL(t));
+            if (init && TREE_CODE(init) == INTEGER_CST) {
+                *out = (int)TREE_INT_CST_LOW(init);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto method_name = [&](tree t) -> const char* {
+        t = peel(t);
+        if (!t) return "unknown";
+
+        if (TREE_CODE(t) == ADDR_EXPR) {
+            t = peel(TREE_OPERAND(t, 0));
+            if (!t) return "unknown";
+        }
+
+        if (TREE_CODE(t) == PTRMEM_CST) {
+            tree mem = peel(PTRMEM_CST_MEMBER(t));
+            if (!mem) return "unknown";
+            if (TREE_CODE(mem) == FUNCTION_DECL) {
+                tree dn = DECL_NAME(mem);
+                return dn ? IDENTIFIER_POINTER(dn) : "unknown";
+            }
+            if (TREE_CODE(mem) == OVERLOAD) {
+                tree fn = OVL_FUNCTION(mem);
+                if (fn && TREE_CODE(fn) == FUNCTION_DECL) {
+                    tree dn = DECL_NAME(fn);
+                    return dn ? IDENTIFIER_POINTER(dn) : "unknown";
+                }
+            }
+            if (TREE_CODE(mem) == BASELINK) {
+                tree fns = BASELINK_FUNCTIONS(mem);
+                if (fns && TREE_CODE(fns) == OVERLOAD) {
+                    tree fn = OVL_FUNCTION(fns);
+                    if (fn && TREE_CODE(fn) == FUNCTION_DECL) {
+                        tree dn = DECL_NAME(fn);
+                        return dn ? IDENTIFIER_POINTER(dn) : "unknown";
+                    }
+                }
+            }
+        }
+        return "unknown";
+    };
+
+    auto process_one_type = [&](tree arg_ty) {
+        if (!arg_ty) return;
+
+        if (PACK_EXPANSION_P(arg_ty))
+            arg_ty = PACK_EXPANSION_PATTERN(arg_ty);
+
+        if (TYPE_P(arg_ty)) arg_ty = TYPE_MAIN_VARIANT(arg_ty);
+        if (!TYPE_P(arg_ty)) return;
+
+        const char* nm = type_name_cstr(arg_ty);
+        if (!nm) return;
+
         tree inner = class_template_args(arg_ty);
-        if (!inner || TREE_CODE(inner) != TREE_VEC)
-            continue;
-
+        if (!inner || TREE_CODE(inner) != TREE_VEC) return;
         const int M = TREE_VEC_LENGTH(inner);
 
-        // Heuristic by shape:
-        //   State<STATE, &C::m, NEXT>                       -> 3 args
-        //   Timed_State<STATE, &C::m, TimeGuard<...>, NEXT> -> 4 args
-        if (M == 3) {
+        if (strcmp(nm, "State") == 0 && M >= 3) {
             process_typestate_template_args(inner);
-        } else if (M == 4) {
-            // Additional sanity: check arg1 is &C::m (PTRMEM_CST)
-            tree a1 = TREE_VEC_ELT(inner, 1);
-            if (a1 && TREE_CODE(a1) == PTRMEM_CST) {
-                process_timed_typestate_args(inner);
+            return;
+        }
+
+        if (strcmp(nm, "Branch_State") == 0 && M >= 3) {
+            int from_st;
+            if (!get_int(TREE_VEC_ELT(inner, 0), &from_st)) return;
+            const char* m = method_name(TREE_VEC_ELT(inner, 1));
+
+            tree list_ty = TREE_VEC_ELT(inner, 2);
+            if (list_ty && TYPE_P(list_ty)) {
+                fprintf(stderr, "[Coconut] DETECTED Branch_State: from=%d method=%s\n", from_st, m);
+                fflush(stderr);
+                process_choice_list_type(list_ty, from_st, m); // <--- call your new function
             }
+            return;
+        }
+
+           if (strcmp(nm, "Timed_Branch_State") == 0 && M >= 4) {
+            int from_st;
+            if (!get_int(TREE_VEC_ELT(inner, 0), &from_st)) return;
+            const char* m = method_name(TREE_VEC_ELT(inner, 1));
+
+            tree list_ty = TREE_VEC_ELT(inner, 3);
+            if (list_ty && TYPE_P(list_ty)) {
+             //   fprintf(stderr, "[Coconut] DETECTED Timed_Branch_State: from=%d method=%s\n", from_st, m);
+             //   fflush(stderr);
+                process_choice_list_type(list_ty, from_st, m); // <--- call your new function
+            }
+            return;
+        }
+    };
+
+    // ---- Cycle<N> at index 0 ----
+    tree cycle_ty = TREE_VEC_ELT(ts_args_vec, 0);
+    if (cycle_ty && TYPE_P(cycle_ty)) {
+        cycle_ty = TYPE_MAIN_VARIANT(cycle_ty);
+        tree cycle_args = class_template_args(cycle_ty);
+        if (cycle_args && TREE_CODE(cycle_args) == TREE_VEC && TREE_VEC_LENGTH(cycle_args) >= 1) {
+            int n;
+            if (get_int(TREE_VEC_ELT(cycle_args, 0), &n)) {
+                g_cycle_n = n;
+                fprintf(stderr, "[Coconut] cycle_n=%d\n", g_cycle_n);
+                fflush(stderr);
+            }
+        }
+    }
+
+    // ---- Ts... unpacking ----
+    for (int i = 1; i < N; ++i) {
+        tree arg = TREE_VEC_ELT(ts_args_vec, i);
+        if (!arg) continue;
+
+        if (TREE_CODE(arg) == TYPE_ARGUMENT_PACK) {
+            tree packed = ARGUMENT_PACK_ARGS(arg);
+            if (packed && TREE_CODE(packed) == TREE_VEC) {
+                const int P = TREE_VEC_LENGTH(packed);
+                for (int k = 0; k < P; ++k)
+                    process_one_type(TREE_VEC_ELT(packed, k));
+            }
+        } else {
+            process_one_type(arg);
         }
     }
 }
+
+
+
+enum CondOp { OP_EQ, OP_NE, OP_OTHER };
+
+
+static bool extract_eq_ne_with_const(
+    gimple* cond_stmt, tree res,
+    CondOp &op, int &K)
+{
+    if (!cond_stmt || gimple_code(cond_stmt) != GIMPLE_COND) return false;
+
+    enum tree_code code = gimple_cond_code(cond_stmt);
+    if (code != EQ_EXPR && code != NE_EXPR) return false;
+
+    op = (code == EQ_EXPR) ? OP_EQ : OP_NE;
+
+    tree lhs = strip_nops(gimple_cond_lhs(cond_stmt));
+    tree rhs = strip_nops(gimple_cond_rhs(cond_stmt));
+    res      = strip_nops(res);
+    if (!lhs || !rhs || !res) return false;
+
+    if (lhs == res) return get_const_int(rhs, K);
+    if (rhs == res) return get_const_int(lhs, K);
+    return false;
+}
+
 
 
 static void harvest_all_functions() {
@@ -911,7 +1340,7 @@ static const bool   kFailBuildOnViolation = false;  // set true to error out
 static const double kAbsTolMs             = 1e-3;   // 1 µs
 static const double kRelTol               = 1e-6;   // 1 ppm
 
-// Your TimedInfo fields are in MILLISECONDS:
+
 static inline double to_ms_ll(long long v_ms) { return static_cast<double>(v_ms); }
 
 
@@ -971,11 +1400,7 @@ static void report_violation(bool as_error, const char* fmt, ...) {
 
 
 
-// ======================== FULL VALIDATOR ========================
-// -----------------------------------------------------------------------------
-// Timing validation per the paper's semantics (HARD/FIRM vs SOFT; sporadic; and
-// system-level feasibility via a per-activation timeline).
-// -----------------------------------------------------------------------------
+/* these functions are used for checking platform meeting time limits */
 
 enum class Contract { HARD, SOFT }; // FIRM folds into HARD
 
@@ -997,17 +1422,17 @@ static inline double ns_to_ms(long long ns) { return to_ms_ll(ns); }
 // If period present but no deadline, treat as SPORADIC: period = min inter-arrival,
 // not a per-transition budget.
 static inline bool is_sporadic(const TimedInfo& ti) {
-    return (ti.period_ns > 0 && ti.deadline_ns == 0);
+    return (ti.period_ns > 0 && ti.U_deadline_ns == 0);
 }
 
 // Worst-case release instant (release + jitter)
 static inline long long worst_release_ns(const TimedInfo& ti) {
-    long long j = ti.jitter_ns;
+    long long j = ti.offest_ns;
     if (j < 0) j = 0;
     return  j;
 }
 
-// ===== window helpers (milliseconds) =========================================
+//  window helpers (milliseconds)
 static const double kTimelineAbsTolMs = 1e-3; // 1 µs tolerance
 
 static inline double current_window_start(double t_now,
@@ -1037,11 +1462,12 @@ static bool check_edge_timing_ms(int state_id,
                                  double wcet_ms,
                                  double& t_abs /* in/out */)
 {
-    // TimedInfo fields are stored in *milliseconds* in your project:
+
     const double period_ms   = static_cast<double>(ti.period_ns);
    
-    const double deadline_ms = static_cast<double>(ti.deadline_ns);
-    const double offset_ms   = static_cast<double>(ti.jitter_ns); // <-- if spelled offest_ns, change here
+    const double deadline_ms = static_cast<double>(ti.U_deadline_ns);
+    const double l_deadline_ms = static_cast<double>(ti.L_deadline_ns);
+    const double offset_ms   = static_cast<double>(ti.offest_ns); 
     const int    crit        = static_cast<int>(ti.criticality);
 
     const double tol = kTimelineAbsTolMs;
@@ -1114,7 +1540,7 @@ static void run_timeline_for_state_ms(
     if (all_ok && !edges.empty()) {
         const TimedInfo& last = std::get<2>(edges.back());
         const double period_ms = static_cast<double>(last.period_ns);
-       const double offset_ms   = static_cast<double>(last.jitter_ns); // <-- if spelled offest_ns, change here
+       const double offset_ms   = static_cast<double>(last.offest_ns); 
         if (period_ms > 0.0) {
             const double win_start = current_window_start(t_abs, period_ms, offset_ms);
             const double slack = (win_start + period_ms) - t_abs;
@@ -1128,14 +1554,13 @@ static void run_timeline_for_state_ms(
     }
 }
 
-// Emit an ASAP (no waiting) end-to-end trace that follows the first edge each step.
 #include <set>
 
-// Deduplicate rules (call this once before validating/printing)
+
 static inline bool same_ti(const TimedInfo& a, const TimedInfo& b) {
     return
            a.period_ns   == b.period_ns   &&
-           a.deadline_ns == b.deadline_ns &&
+           a.U_deadline_ns == b.U_deadline_ns &&
            a.criticality == b.criticality;
 }
 static void normalize_rules() {
@@ -1149,7 +1574,7 @@ static void normalize_rules() {
                 const auto& ay = std::get<2>(y);
               //  if (ax.release_ns  != ay.release_ns)  return ax.release_ns  < ay.release_ns;
                 if (ax.period_ns   != ay.period_ns)   return ax.period_ns   < ay.period_ns;
-                if (ax.deadline_ns != ay.deadline_ns) return ax.deadline_ns < ay.deadline_ns;
+                if (ax.U_deadline_ns != ay.U_deadline_ns) return ax.U_deadline_ns < ay.U_deadline_ns;
                 return ax.criticality < ay.criticality;
             });
         v.erase(std::unique(v.begin(), v.end(),
@@ -1161,7 +1586,7 @@ static void normalize_rules() {
     }
 }
 
-// Robust WCET lookup (same as before; keep yours if already added)
+// Robust WCET lookup 
 static double wcet_lookup_ms_for_state_method(
     int from_state,
     const std::string& method,
@@ -1189,7 +1614,7 @@ static double wcet_lookup_ms_for_state_method(
     return 0.0;
 }
 
-// End-to-end ASAP trace that stops on repeat
+// End-to-end  trace that stops on repeat
 static void emit_end_to_end_asap_trace(
     const std::unordered_map<const void*, std::unordered_map<std::string,double>>& wcet_by_class)
 {
@@ -1245,8 +1670,8 @@ static void emit_end_to_end_asap_trace(
     step, t_ms, method.c_str(), step + 1, t_next);
 
 
-        if (ti.deadline_ns > 0) {
-            std::fprintf(stderr, " (d<%.4f ms)", ns_to_ms(ti.deadline_ns));
+        if (ti.U_deadline_ns > 0) {
+            std::fprintf(stderr, " (d<%.4f ms)", ns_to_ms(ti.U_deadline_ns));
         } else if (ti.period_ns > 0) {
             std::fprintf(stderr, " (p%s%.4f ms)", is_sporadic(ti) ? ">=" : "=", ns_to_ms(ti.period_ns));
         }
@@ -1260,7 +1685,578 @@ static void emit_end_to_end_asap_trace(
 
 
 
-// ======================== FULL VALIDATOR ========================
+
+
+/** functions below used for sep logic checking  */
+
+
+using TimedEdge = std::tuple<std::string, int, TimedInfo>;
+using TimedTypestateRules = std::unordered_map<int, std::vector<TimedEdge>>;
+
+
+
+struct EdgeRule {
+  int from_state;
+  int to_state;
+  TimedInfo ti;
+};
+
+static std::unordered_map<std::string, std::vector<EdgeRule>> g_rules_by_method;
+
+static std::unordered_map<std::string, long long> g_wcet_ns_by_func;
+
+// plugin args
+static std::string g_out_dir = ".";
+static std::string g_wcet_json_path;
+static int g_warn_on_missing_delay_criticality_ge = 0; // 0 = off by default
+static int g_search_window_stmts = 8;                  // proximity window in a BB
+
+static std::string trim(std::string s) {
+  while (!s.empty() && std::isspace((unsigned char)s.front())) s.erase(s.begin());
+  while (!s.empty() && std::isspace((unsigned char)s.back()))  s.pop_back();
+  return s;
+}
+
+static bool ends_with(const std::string& s, const std::string& suffix) {
+  return s.size() >= suffix.size() && s.compare(s.size()-suffix.size(), suffix.size(), suffix) == 0;
+}
+
+
+static std::string get_method_key_from_fndecl(tree fndecl) {
+  if (!fndecl) return {};
+  tree name = DECL_NAME(fndecl);
+  if (!name) return {};
+
+  const char* id = IDENTIFIER_POINTER(name);
+  if (!id) return {};
+  return std::string(id);
+}
+
+static bool method_matches_rule(const std::string& callee_key, const std::string& rule_method) {
+  if (callee_key == rule_method) return true;
+
+  // If rule_method is unqualified and callee is mangled, attempt suffix match.
+  
+  if (!rule_method.empty() && callee_key.find(rule_method) != std::string::npos) {
+    // Slightly stricter: require it appears near end
+    if (ends_with(callee_key, rule_method + "Ev") || ends_with(callee_key, rule_method) )
+      return true;
+
+  }
+  return false;
+}
+
+// Returns vector of all rules that match this callee key.
+// We index by rule_method string, but we allow suffix match as fallback.
+static std::vector<std::pair<std::string, const std::vector<EdgeRule>*>>
+lookup_rules_for_callee(const std::string& callee_key) {
+  std::vector<std::pair<std::string, const std::vector<EdgeRule>*>> out;
+
+  // Fast path: direct key hit
+  auto it = g_rules_by_method.find(callee_key);
+  if (it != g_rules_by_method.end()) {
+    out.push_back({callee_key, &it->second});
+    return out;
+  }
+
+  // Fallback: suffix/contains matching against all rule method keys
+  for (auto& kv : g_rules_by_method) {
+    const std::string& rule_method = kv.first;
+    if (method_matches_rule(callee_key, rule_method)) {
+      out.push_back({rule_method, &kv.second});
+    }
+  }
+  return out;
+}
+
+enum class DelayUnit { NS, US, MS };
+static double to_ms(double v, DelayUnit u) {
+  switch (u) {
+    case DelayUnit::NS: return v / 1e6;
+    case DelayUnit::US: return v / 1e3;
+    case DelayUnit::MS: return v;
+  }
+  return 0.0;
+}
+struct DelayApi {
+  const char* name;
+  DelayUnit unit;
+  int arg_index;
+};
+
+static const DelayApi g_delay_apis[] = {
+{"hw_delay_ms", DelayUnit::MS, 0},
+  {"DelayMs", DelayUnit::MS, 0},
+  {"delay_ms", DelayUnit::MS, 0},
+  {"HAL_Delay", DelayUnit::MS, 0},
+  {"delay_us", DelayUnit::US, 0},
+  {"simulate_", DelayUnit::MS, 0},
+};
+
+static long long to_ns(long long v, DelayUnit u) {
+  switch (u) {
+    case DelayUnit::NS: return v;
+    case DelayUnit::US: return v * 1000LL;
+    case DelayUnit::MS: return v * 1000LL * 1000LL;
+  }
+  return -1;
+}
+
+static const DelayApi* find_delay_api_by_callee_key(const std::string& key) {
+  for (const auto& api : g_delay_apis) {
+    if (key == api.name) return &api;
+    // allow matching when the key is mangled and name appears
+    if (key.find(api.name) != std::string::npos) return &api;
+  }
+  return nullptr;
+}
+
+#include "real.h"
+// Extract a constant integer argument from gimple call
+static bool extract_const_number_arg(gimple* call, int arg_index, double* out) {
+  if (!call || !is_gimple_call(call)) return false;
+  if (arg_index < 0 || arg_index >= (int)gimple_call_num_args(call)) return false;
+
+  tree arg = gimple_call_arg(call, arg_index);
+  if (!arg) return false;
+
+  if (TREE_CODE(arg) == INTEGER_CST) {
+    *out = (double)TREE_INT_CST_LOW(arg);
+    return true;
+  }
+
+ if (TREE_CODE(arg) == REAL_CST) {
+  char buf[64];
+  real_to_decimal(buf, &TREE_REAL_CST(arg), sizeof(buf), 0, 1);
+  *out = atof(buf);
+  return true;
+}
+
+  return false;
+}
+// ------------------------ Index timed rules ------------------------
+
+static void index_timed_rules() {
+  g_rules_by_method.clear();
+
+  for (const auto& kv : Timed_Typestate_Rules) {
+    int from = kv.first;
+    const auto& edges = kv.second;
+
+    for (const auto& edge : edges) {
+      const std::string& method = std::get<0>(edge);
+      int to = std::get<1>(edge);
+      const TimedInfo& ti = std::get<2>(edge);
+
+      g_rules_by_method[method].push_back(EdgeRule{from, to, ti});
+    }
+  }
+}
+
+
+struct NearbyDelay {
+  bool found = false;
+  bool const_value = false;
+   double delay_ms = 0.0;      // <-- ms
+  location_t loc = UNKNOWN_LOCATION;
+  std::string api_key;
+};
+
+static std::vector<gimple*> collect_bb_stmts(basic_block bb) {
+  std::vector<gimple*> v;
+  for (gimple_stmt_iterator gsi = gsi_start_bb(bb); !gsi_end_p(gsi); gsi_next(&gsi)) {
+    v.push_back(gsi_stmt(gsi));
+  }
+  return v;
+}
+
+
+
+static NearbyDelay find_nearby_delay_in_bb(const std::vector<gimple*>& stmts, int call_index) {
+  NearbyDelay nd;
+
+  int lo = std::max(0, call_index - g_search_window_stmts);
+  int hi = std::min((int)stmts.size() - 1, call_index + g_search_window_stmts);
+
+  // Search backward first (common pattern: Delay(); Transition();)
+  for (int j = call_index - 1; j >= lo; --j) {
+    gimple* st = stmts[j];
+    if (!is_gimple_call(st)) continue;
+
+    tree callee = gimple_call_fndecl(st);
+    std::string key = get_method_key_from_fndecl(callee);
+    const DelayApi* api = find_delay_api_by_callee_key(key);
+    if (!api) continue;
+
+    nd.found = true;
+    nd.loc = gimple_location(st);
+    nd.api_key = key;
+
+    double raw = 0.0;
+    if (extract_const_number_arg(st, api->arg_index, &raw)) {
+      nd.const_value = true;
+      nd.delay_ms = to_ms(raw, api->unit);
+    }
+    return nd;
+  }
+
+  // Then search forward (pattern: Transition(); Delay();)
+  for (int j = call_index + 1; j <= hi; ++j) {
+    gimple* st = stmts[j];
+    if (!is_gimple_call(st)) continue;
+
+    tree callee = gimple_call_fndecl(st);
+    std::string key = get_method_key_from_fndecl(callee);
+    const DelayApi* api = find_delay_api_by_callee_key(key);
+    if (!api) continue;
+
+    nd.found = true;
+    nd.loc = gimple_location(st);
+    nd.api_key = key;
+
+    double raw = 0.0;
+    if (extract_const_number_arg(st, api->arg_index, &raw)) {
+      nd.const_value = true;
+      nd.delay_ms = to_ms(raw, api->unit);
+    }
+    return nd;
+  }
+
+  return nd;
+}
+
+static void report_delay_violation(location_t where,
+                                  const std::string& method_rule_key,
+                                  const EdgeRule& er,
+                                  const NearbyDelay& nd)
+{
+  // Rules are milliseconds 
+  const double L = (double)er.ti.L_deadline_ns; // 
+  const double U = (double)er.ti.U_deadline_ns; //
+
+  char d[64], l[64], u[64];
+  std::snprintf(d, sizeof(d), "%.3f", (double)nd.delay_ms);
+  std::snprintf(l, sizeof(l), "%.3f", L);
+  std::snprintf(u, sizeof(u), "%.3f", U);
+
+  const char* api = nd.api_key.empty() ? "<none>" : nd.api_key.c_str();
+
+  warning_at(where, 0,
+    "Timed typestate violation for method rule %qs: delay=%s ms (via %qs) not in [%s, %s] ms "
+    "(edge %d->%d, criticality=%d) It will not compile regardless of the hardware",
+    method_rule_key.c_str(),
+    d,
+    api,
+    l,
+    u,
+    er.from_state,
+    er.to_state,
+    er.ti.criticality);
+}
+
+static void report_missing_delay(location_t where,
+                                 const std::string& method_rule_key,
+                                 const EdgeRule& er)
+{
+  const double L = (double)er.ti.L_deadline_ns; 
+  const double U = (double)er.ti.U_deadline_ns; 
+
+  char l[64], u[64];
+  std::snprintf(l, sizeof(l), "%.3f", L);
+  std::snprintf(u, sizeof(u), "%.3f", U);
+
+  warning_at(where, 0,
+    "Timed typestate: no explicit delay found for rule %qs "
+    "(edge %d->%d, deadline [%s,%s] ms, criticality=%d)",
+    method_rule_key.c_str(),
+    er.from_state,
+    er.to_state,
+    l,
+    u,
+    er.ti.criticality);
+}
+
+static void report_unknown_delay(location_t where,
+                                 const std::string& method_rule_key,
+                                 const EdgeRule& er,
+                                 const NearbyDelay& nd)
+{
+  const double L = (double)er.ti.L_deadline_ns; 
+  const double U = (double)er.ti.U_deadline_ns; 
+
+  char l[64], u[64];
+  std::snprintf(l, sizeof(l), "%.3f", L);
+  std::snprintf(u, sizeof(u), "%.3f", U);
+
+  const char* api = nd.api_key.empty() ? "<none>" : nd.api_key.c_str();
+
+  warning_at(where, 0,
+    "Timed typestate: found delay call (%qs) for rule %qs but delay argument is not a constant; cannot verify bounds "
+    "(edge %d->%d, deadline [%s,%s] ms, criticality=%d)",
+    api,
+    method_rule_key.c_str(),
+    er.from_state,
+    er.to_state,
+    l,
+    u,
+    er.ti.criticality);
+}
+
+
+static int g_debug_timed = 1; // set to 0 to silence
+
+static const char* safe_ident(tree id) {
+  return id ? IDENTIFIER_POINTER(id) : "<null>";
+}
+
+static std::string fndecl_key(tree fndecl) {
+  if (!fndecl) return {};
+  tree n = DECL_NAME(fndecl);
+  if (!n) return {};
+  const char* s = IDENTIFIER_POINTER(n);
+  return s ? std::string(s) : std::string{};
+}
+
+static NearbyDelay find_any_delay_in_current_function() {
+  NearbyDelay nd;
+
+  basic_block bb;
+  FOR_ALL_BB_FN(bb, cfun) {
+    auto stmts = collect_bb_stmts(bb);
+    for (gimple* st : stmts) {
+      if (!is_gimple_call(st)) continue;
+
+      tree callee = gimple_call_fndecl(st);
+      if (!callee) continue;
+
+      std::string key = get_method_key_from_fndecl(callee);
+      if (key.empty()) continue;
+
+      const DelayApi* api = find_delay_api_by_callee_key(key);
+      if (!api) continue;
+
+      nd.found = true;
+      nd.loc = gimple_location(st);
+      nd.api_key = key;
+
+      double raw = 0.0;
+      if (extract_const_number_arg(st, api->arg_index, &raw)) {
+        nd.const_value = true;
+        nd.delay_ms = to_ms(raw, api->unit);
+      }
+      return nd; // take first delay found
+    }
+  }
+
+  return nd; // not found
+}
+
+static void validate_one_function(tree fndecl) {
+  if (!fndecl) return;
+  if (!DECL_STRUCT_FUNCTION(fndecl)) return;
+  if (g_rules_by_method.empty()) return;
+
+  const std::string fn_key = fndecl_key(fndecl);
+
+  push_cfun(DECL_STRUCT_FUNCTION(fndecl));
+
+  // ---------------- Debug counters ----------------
+  long long calls_total = 0;
+  long long calls_with_fndecl = 0;
+  long long calls_matched_rule = 0;
+  long long callsite_delay_found = 0;
+  long long callsite_delay_const = 0;
+
+  //
+  // Part A: “Self-match” check
+  // If the *function being validated* is itself one of the timed
+  // rule methods (e.g., Green/Red/Amber/RedAmber), then look for
+  // delay inside the function (simulate_, delay_ms, etc.) and check
+  // bounds directly against the rules for that method.
+  //
+  {
+    auto self_matches = lookup_rules_for_callee(fn_key);
+    if (!self_matches.empty()) {
+      NearbyDelay nd = find_any_delay_in_current_function();
+
+      if (g_debug_timed) {
+      //  fprintf(stderr,
+            //    "[timed] SELF fn=%s rules=%zu delay_found=%d const=%d ns=%lld api=%s\n",
+             //   fn_key.c_str(),
+             //   self_matches.size(),
+             //   nd.found ? 1 : 0,
+             //   nd.const_value ? 1 : 0,
+             //   (long long)nd.delay_ms,
+               // nd.api_key.empty() ? "<none>" : nd.api_key.c_str());
+      }
+
+      // Use a stable location: function decl location
+      location_t where = DECL_SOURCE_LOCATION(fndecl);
+
+      for (auto& m : self_matches) {
+        const std::string& method_rule_key = m.first;
+        const std::vector<EdgeRule>& edges = *m.second;
+
+        for (const EdgeRule& er : edges) {
+          if (!nd.found) {
+            // No delay inside transition method
+            if (g_warn_on_missing_delay_criticality_ge > 0 &&
+                er.ti.criticality >= g_warn_on_missing_delay_criticality_ge) {
+              report_missing_delay(where, method_rule_key, er);
+            }
+            continue;
+          }
+
+          if (!nd.const_value) {
+            if (g_warn_on_missing_delay_criticality_ge > 0 &&
+                er.ti.criticality >= g_warn_on_missing_delay_criticality_ge) {
+              report_unknown_delay(where, method_rule_key, er, nd);
+            }
+            continue;
+          }
+
+          if (nd.delay_ms < er.ti.L_deadline_ns || nd.delay_ms > er.ti.U_deadline_ns) {
+            report_delay_violation(where, method_rule_key, er, nd);
+          } else if (g_debug_timed) {
+         //   fprintf(stderr,
+                 //   "[timed] SELF-OK fn=%s delay_ms=%f bounds=[%f,%f] crit=%d\n",
+                  //  fn_key.c_str(),
+                  //  nd.delay_ms,
+                  //  er.ti.L_deadline_ns,
+                  //  er.ti.U_deadline_ns,
+                   // er.ti.criticality);
+          }
+        }
+      }
+    }
+  }
+
+  // ==========================================================
+  // Part B: “Call-site” check
+  // For calls *inside this function* that invoke a timed-rule method,
+  // look for a nearby delay call in the same basic block and check bounds.
+  // This matches patterns like:
+  //    DelayMs(3000); obj.Green();
+  // ==========================================================
+  basic_block bb;
+  FOR_ALL_BB_FN(bb, cfun) {
+    auto stmts = collect_bb_stmts(bb);
+
+    for (int idx = 0; idx < (int)stmts.size(); ++idx) {
+      gimple* st = stmts[idx];
+      if (!is_gimple_call(st)) continue;
+      calls_total++;
+
+      tree callee = gimple_call_fndecl(st);
+      if (!callee) continue;
+      calls_with_fndecl++;
+
+      std::string callee_key = get_method_key_from_fndecl(callee);
+      if (callee_key.empty()) continue;
+
+      // Debug: print first few calls per function
+      if (g_debug_timed && calls_total <= 8) {
+      //  fprintf(stderr, "[timed] fn=%s call=%s\n",
+              //  fn_key.c_str(), callee_key.c_str());
+      }
+
+      // Is this call a transition method referenced by any timed rule?
+      auto matches = lookup_rules_for_callee(callee_key);
+      if (matches.empty()) continue;
+      calls_matched_rule++;
+
+      if (g_debug_timed) {
+     //   fprintf(stderr, "[timed] MATCH fn=%s callee=%s (matched %zu rule-keys)\n",
+            //    fn_key.c_str(), callee_key.c_str(), matches.size());
+      }
+
+      NearbyDelay nd = find_nearby_delay_in_bb(stmts, idx);
+      if (nd.found) {
+        callsite_delay_found++;
+        if (nd.const_value) callsite_delay_const++;
+      }
+
+      if (g_debug_timed) {
+        if (nd.found) {
+         // fprintf(stderr, "[timed]   nearby delay: api=%s const=%d ns=%lld\n",
+             //     nd.api_key.c_str(), nd.const_value ? 1 : 0, (long long)nd.delay_ms);
+        } else {
+       //   fprintf(stderr, "[timed]   nearby delay: NONE (window=%d stmts)\n",
+                //  g_search_window_stmts);
+        }
+      }
+
+      location_t call_loc = gimple_location(st);
+
+      // For each matched rule-method key and its edges
+      for (auto& m : matches) {
+        const std::string& method_rule_key = m.first;
+        const std::vector<EdgeRule>& edges = *m.second;
+
+        for (const EdgeRule& er : edges) {
+          if (nd.found) {
+            if (!nd.const_value) {
+              if (g_warn_on_missing_delay_criticality_ge > 0 &&
+                  er.ti.criticality >= g_warn_on_missing_delay_criticality_ge) {
+                report_unknown_delay(call_loc, method_rule_key, er, nd);
+              }
+            } else {
+              if (nd.delay_ms < er.ti.L_deadline_ns || nd.delay_ms > er.ti.U_deadline_ns) {
+                report_delay_violation(call_loc, method_rule_key, er, nd);
+              }
+            }
+          } else {
+            if (g_warn_on_missing_delay_criticality_ge > 0 &&
+                er.ti.criticality >= g_warn_on_missing_delay_criticality_ge) {
+              report_missing_delay(call_loc, method_rule_key, er);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (g_debug_timed && (calls_total > 0 || calls_matched_rule > 0)) {
+  //  fprintf(stderr,
+       //     "[timed] SUMMARY fn=%s calls=%lld fndecl_calls=%lld matched=%lld callsite_delay_found=%lld callsite_delay_const=%lld\n",
+       //     fn_key.c_str(),
+         //   calls_total,
+         //   calls_with_fndecl,
+         //   calls_matched_rule,
+         //   callsite_delay_found,
+          //  callsite_delay_const);
+  }
+
+  pop_cfun();
+}
+
+
+static void validate_logic_with_timed_rules() {
+  setvbuf(stderr, NULL, _IONBF, 0);
+  //fprintf(stderr, "[timed] FINISH_UNIT validate_logic_with_timed_rules\n");
+
+  index_timed_rules();
+ // fprintf(stderr, "[timed] indexed rules=%zu\n", g_rules_by_method.size());
+
+  cgraph_node* node = nullptr;
+  FOR_EACH_DEFINED_FUNCTION(node) {
+    tree fndecl = node->decl;
+    if (!fndecl) continue;
+    if (!DECL_STRUCT_FUNCTION(fndecl)) continue;
+    if (DECL_ARTIFICIAL(fndecl)) continue;
+
+    push_cfun(DECL_STRUCT_FUNCTION(fndecl));
+    if (cfun && cfun->cfg) {
+   //   fprintf(stderr, "[timed] validating %s\n", fndecl_key(fndecl).c_str());
+      validate_one_function(fndecl);
+    }
+    pop_cfun();
+  }
+}
+
+
+
+/* here is the platform checking */
 static void validate_wcet_vs_timed_rules() {
     // 1) WCET source (prefer class-aware; else fallback)
     normalize_rules();
@@ -1272,8 +2268,8 @@ static void validate_wcet_vs_timed_rules() {
     }
 
     if (kDebugValidate) {
-        std::fprintf(stderr, "[validate] using %s for WCETs\n",
-                     used_fallback ? "g_rows (fallback)" : "g_annot_wcet_ms");
+      //  std::fprintf(stderr, "[validate] using %s for WCETs\n",
+               //      used_fallback ? "g_rows (fallback)" : "g_annot_wcet_ms");
         dump_wcet_buckets(wcet_by_class);
     }
 
@@ -1321,10 +2317,10 @@ static void validate_wcet_vs_timed_rules() {
             state_bucket[from_state] = nullptr;
 
         if (kDebugValidate) {
-            std::fprintf(stderr, "[validate] state=%d class_key=%p  bucket=%s\n",
-                         from_state, cls_key,
-                         (bucket_it == wcet_by_class.end()) ? "NONE" :
-                         (using_null_bucket ? "nullptr (fallback)" : "exact class"));
+       //     std::fprintf(stderr, "[validate] state=%d class_key=%p  bucket=%s\n",
+                    //     from_state, cls_key,
+                      //   (bucket_it == wcet_by_class.end()) ? "NONE" :
+                 //        (using_null_bucket ? "nullptr (fallback)" : "exact class"));
         }
 
         for (const auto& e : edges) {
@@ -1337,9 +2333,9 @@ static void validate_wcet_vs_timed_rules() {
                 g_recursive_transitions.push_back({ method, from_state });
                 g_recursive_method_transitions.insert(method);
                 if (kDebugValidate) {
-                    std::fprintf(stderr,
-                        "[validate] detected recursive transition: state %d, method '%s'\n",
-                        from_state, method.c_str());
+                   // std::fprintf(stderr,
+                     //   "[validate] detected recursive transition: state %d, method '%s'\n",
+                      //  from_state, method.c_str());
                 }
             }
 
@@ -1348,9 +2344,10 @@ static void validate_wcet_vs_timed_rules() {
             const char* rule_src = "none";
             const bool spor = is_sporadic(ti);
             const Contract ctr = contract_from_criticality(ti.criticality);
-
-            if (ti.deadline_ns > 0) {
-                rule_ms = ns_to_ms(ti.deadline_ns);
+            double lower_rule_ms =0.0;
+            if (ti.U_deadline_ns > 0) {
+                rule_ms = ns_to_ms(ti.U_deadline_ns);
+                lower_rule_ms=ns_to_ms(ti.L_deadline_ns);
                 rule_src = "deadline";
             } else if (ti.period_ns > 0 && !spor) {
                 rule_ms = ns_to_ms(ti.period_ns);
@@ -1418,8 +2415,8 @@ static void validate_wcet_vs_timed_rules() {
             bool soft_over    = false;
 
             if (ctr == Contract::HARD) {
-                // HARD/FIRM: WCET must not exceed the budget (within tolerance)
-                hard_violate = (wcet_ms > rule_ms);
+                // HARD/FIRM: WCET must not exceed the budget (within tolerance) witin lower and upper 
+               hard_violate = (wcet_ms < lower_rule_ms) || (wcet_ms > rule_ms);
             } else {
                 // SOFT: warn if near/equal or exceeding
                 if (wcet_ms > rule_ms + tol) {
@@ -1446,8 +2443,8 @@ static void validate_wcet_vs_timed_rules() {
             if (ctr == Contract::HARD && hard_violate) {
                 report_violation(true,
                     "WCET violates Time contract for '%s' (state %d): wcet=%.6f ms, "
-                    "limit=%.6f ms (tol=%.3g).",
-                    method.c_str(), from_state, wcet_ms, rule_ms, tol);
+                    "limit between=%.3f ms and %.3f ms.",
+                    method.c_str(), from_state, wcet_ms, rule_ms, lower_rule_ms);
                 any_violation = true; any_hard_violation = true; ok = false;
             } else if (ctr == Contract::SOFT && soft_warn) {
                 if (soft_over) {
@@ -1540,8 +2537,8 @@ static void validate_wcet_vs_timed_rules() {
                     s.recursive ? " [recursive]" : "",
                     i + 1, t_next);
 
-                if (ti.deadline_ns > 0) {
-                    std::fprintf(stderr, " (d<%.4f ms)", ns_to_ms(ti.deadline_ns));
+                if (ti.U_deadline_ns > 0) {
+                    std::fprintf(stderr, " (d<%.4f ms)", ns_to_ms(ti.U_deadline_ns));
                 } else if (ti.period_ns > 0) {
                     std::fprintf(stderr, " (p%s%.4f ms)",
                                  is_sporadic(ti) ? ">=" : "=",
@@ -1564,10 +2561,10 @@ static void validate_wcet_vs_timed_rules() {
 
     if (!ok) {
         if (kDebugValidate) {
-            std::fprintf(stderr, "[validate] FAIL: %s%s%s\n",
-                any_hard_violation ? "hard violations " : "",
-                (any_violation && !any_hard_violation) ? "violations " : "",
-                any_missing ? "(missing entries)" : "");
+           // std::fprintf(stderr, "[validate] FAIL: %s%s%s\n",
+             //   any_hard_violation ? "hard violations " : "",
+              //  (any_violation && !any_hard_violation) ? "violations " : "",
+                //any_missing ? "(missing entries)" : "");
         }
         // Only hard-stop on HARD/FIRM violations
         if (kFailBuildOnViolation && any_hard_violation) {
@@ -1587,6 +2584,9 @@ static void validate_wcet_vs_timed_rules() {
     emit_end_to_end_asap_trace(wcet_by_class);
 }
 
+
+
+/* used for checking subclass typestate is LSP comliant with superclass */
 
 void validate_LSP_compliance() {
     for (const auto& [subclass, sub_fsm] : FSM_by_Class) {
@@ -1656,6 +2656,8 @@ void process_TypestateClassConnector_args(tree tmpl_args) {
         printf("Failed to extract any template arguments of TypestateClassConnectorFlag.\n");
     }
 }
+
+
 // Template instantiation processing
 
 static void on_template_instantiation(void* gcc_data, void* user_data) {
@@ -1670,7 +2672,7 @@ static void on_template_instantiation(void* gcc_data, void* user_data) {
         if (!decl_name) return;
 
         if (decl_name) {
-    // 1) Existing direct cases (keep them, harmless if they fire)
+    // 1) Existing direct cases 
     if (strcmp(decl_name, "State") == 0) {
         if (tree ta = DECL_TI_ARGS(fn_decl)) process_typestate_template_args(ta);
         return;
@@ -1792,9 +2794,10 @@ static void Typestate_Visualisation(const std::string& filename,
             lbl << method
                // << "\\nR=" << fmt(ti.release_ns)
                 << " P="  << fmt(ti.period_ns)
-                << " D="  << fmt(ti.deadline_ns)
-                << " Offset=" << fmt(ti.jitter_ns)
-                << " C="  << ti.criticality;
+                << " offest="  << fmt(ti.offest_ns)
+                << " Upper=" << fmt(ti.U_deadline_ns)
+                << " Lower="  << fmt(ti.L_deadline_ns)
+                << " C="  << fmt(ti.criticality);
 
             dotFile << "    " << from << " -> " << to << " "
                     << "[label=\"" << escape_label(lbl.str()) << "\"];\n";
@@ -2339,68 +3342,93 @@ public:
 }
 
     // Register a method call and enforce the state transitions
- void Typestate_Checking (tree obj, const std::string& method_name, location_t location) {
-    // Resolve the reference to get the base object
+void Typestate_Checking(tree obj, const std::string& method_name, location_t location) {
     tree obj_address = get_original_object(obj);
-
-   
     tree resolved_obj = track_all_aliases(obj_address);
+    if (!resolved_obj) return;
 
-    if (!resolved_obj) {
-
-        return;
-    }
-
-    // Retrieve the current state of the object
     if (object_states.find(resolved_obj) == object_states.end()) {
-        object_states[resolved_obj] = 0;  
+        object_states[resolved_obj] = 0;
     }
 
     int current_state = object_states[resolved_obj];
 
-    // Check if the method is part of any state transitions
+    // -------------------- CHANGE #1: recognize branch methods too --------------------
     bool is_transition_method = false;
+
+    // normal rules
     for (const auto& state_entry : Typestate_Rules) {
         for (const auto& trans : state_entry.second) {
-            if (trans.first == method_name) {
-                is_transition_method = true;
-                break;
-            }
+            if (trans.first == method_name) { is_transition_method = true; break; }
         }
         if (is_transition_method) break;
     }
 
+    // branch rules (only if not already found)
     if (!is_transition_method) {
-       
+        auto itB = Branch_Rules.find(current_state);
+        if (itB != Branch_Rules.end()) {
+            for (const auto& br : itB->second) {
+                if (br.method == method_name) { is_transition_method = true; break; }
+            }
+        } else {
+            // also consider branch methods that exist in ANY state (optional but helpful)
+            for (const auto& state_entry : Branch_Rules) {
+                for (const auto& br : state_entry.second) {
+                    if (br.method == method_name) { is_transition_method = true; break; }
+                }
+                if (is_transition_method) break;
+            }
+        }
+    }
+    // -------------------------------------------------------------------------------
+
+    if (!is_transition_method) {
         method_calls[resolved_obj].push_back(method_name);
         return;
     }
 
-   
     int next_state = -1;
-    if (Typestate_Rules.find(current_state) != Typestate_Rules.end()) {
-        for (const auto& trans : Typestate_Rules[current_state]) {
+
+    //  Normal typestate lookup 
+    auto it = Typestate_Rules.find(current_state);
+    if (it != Typestate_Rules.end()) {
+        for (const auto& trans : it->second) {
             if (trans.first == method_name) {
-                next_state = trans.second;  
+                next_state = trans.second;
                 break;
             }
         }
     }
-     
-   
 
+    // --------------------  branch fallback (single-state merge) --------------------
+    // If no normal rule found, try Branch_Rules[current_state] for this method and pick ONE.
+    if (next_state == -1) {
+        auto itBr = Branch_Rules.find(current_state);
+        if (itBr != Branch_Rules.end()) {
+            for (const auto& br : itBr->second) {
+                if (br.method == method_name) {
+                   
+                    next_state = br.next;
+
+                   fprintf(stderr,
+                            "[Coconut] BRANCH PICK: state %d method '%s' picked cond=%d next=%d\n",
+                            current_state, method_name.c_str(), br.cond, br.next);
+                   fflush(stderr);
+
+                    break;
+                }
+            }
+        }
+    }
+   
     if (next_state != -1) {
-       
         object_states[resolved_obj] = next_state;
-     printf("Transition: Method '%s' caused the state change from %d to %d.",
-        method_name.c_str(), current_state, next_state);
-   
+        printf("Transition: Method '%s' caused the state change from %d to %d.",
+               method_name.c_str(), current_state, next_state);
     } else {
-   
-     error_at(location, "Error: Method '%s' is not allowed in the current state %d.",
-              method_name.c_str(), current_state);
-         
-
+        error_at(location, "Error: Method '%s' is not allowed in the current state %d.",
+                 method_name.c_str(), current_state);
     }
 
     method_calls[resolved_obj].push_back(method_name);
@@ -2532,6 +3560,21 @@ gimple* get_controlling_cond(basic_block bb) {
 }
 
 
+std::string demangle(const char* mangled) {
+    if (!mangled || !*mangled) {
+        return "";
+    }
+    int status = 0;
+    char* demangled_name = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
+    std::string result;
+    if (status == 0 && demangled_name) {
+        result = demangled_name;
+        free(demangled_name);
+    } else {
+        result = mangled;
+    }
+    return result;
+}
 
 bool is_inside_branch(basic_block bb) {
     if (!bb) return false;
@@ -2595,10 +3638,6 @@ int finalize_if_else_block(int if_else_id) {
 #include "cfgloopmanip.h"
 
 // 1) Normalize names (rules may be unqualified; analysis often demangles qualified)
-static inline std::string unqualified_name(const std::string& demangled) {
-    auto pos = demangled.rfind("::");
-    return (pos == std::string::npos) ? demangled : demangled.substr(pos + 2);
-}
 
 // 2) Rule lookups that accept both qualified and unqualified names
 #include <unordered_set>
@@ -2759,67 +3798,80 @@ static bool true_edge_means_call_true(gimple* term, gimple* call_stmt) {
     return true;
 }
 
-static std::vector<int> transitions_for(int src, const std::string& method,  location_t loc = UNKNOWN_LOCATION) {
-    std::vector<int> out;
-    //findCommonJointStatesAndPrint(Typestate_Rules); // for debug visibility
-    auto it = Typestate_Rules.find(src);
-    if (it == Typestate_Rules.end()) {
-    //  fprintf(stderr, "Debug: transitions_for: no rule entry for src=%d (method='%s')\n",
-           //   src, method.c_str());
-                error_at(loc, "Typestate: no rule entry for state %d and method '%s'.",
-                src, method.c_str()); 
-        return out;
+
+static int branch_next_for_cond(int src_state,
+                                const std::string& method,
+                                long long K)
+{
+    auto itB = Branch_Rules.find(src_state);
+    if (itB == Branch_Rules.end()) return -1;
+
+    const std::string uq = unqualified_name(method);
+
+    for (const auto& br : itB->second) {
+        // br.method is usually unqualified already, but match both.
+        if (br.method == method || br.method == uq) {
+            if (br.cond == (int)K) return br.next;
+        }
     }
+    return -1;
+}
+
+static std::vector<int> transitions_for(int src, const std::string& method, location_t loc = UNKNOWN_LOCATION) {
+    std::vector<int> out;
 
     const std::string uq = unqualified_name(method);
     std::unordered_set<int> seen;
-    int total_considered = 0;
-    int total_matched = 0;
 
-    // Print the rule row we’re about to scan
-  //fprintf(stderr, "Debug: transitions_for: scanning rules for src=%d (method='%s', uq='%s'):\n",
-      //    src, method.c_str(), uq.c_str());
+    //  NEW: read both normal + branch tables --------------------
+    bool any_table_for_src = false;
 
-    for (const auto& kv : it->second) {
-        const std::string& name = kv.first;
-        int dst = kv.second;
-        ++total_considered;
+    // 1) Normal rules
+    auto it = Typestate_Rules.find(src);
+    if (it != Typestate_Rules.end()) {
+        any_table_for_src = true;
 
-        bool name_match = (name == method) || (name == uq);
+        for (const auto& kv : it->second) {
+            const std::string& name = kv.first;
+            int dst = kv.second;
 
-        // Per-entry trace
-     // fprintf(stderr, "  - rule[%d]: name='%s' dst=%d%s\n",
-           //   total_considered, name.c_str(), dst, name_match ? "  <-- match" : "");
+            bool name_match = (name == method) || (name == uq);
+            if (!name_match) continue;
 
-        if (!name_match) continue;
-
-        ++total_matched;
-        if (!seen.count(dst)) {
-            seen.insert(dst);
-            out.push_back(dst);
-        } else {
-            // Duplicate destination suppressed
-        //  fprintf(stderr, "    (duplicate dst=%d suppressed)\n", dst);
+            if (!seen.count(dst)) {
+                seen.insert(dst);
+                out.push_back(dst);
+            }
         }
     }
 
-    // Summary
-    if (out.empty()) {
-     // fprintf(stderr, "Debug: transitions_for: NO transitions for src=%d (method='%s'). "
-            //          "considered=%d matched=%d\n",
-          //    src, method.c_str(), total_considered, total_matched);
-    } else {
-      //fprintf(stderr, "Debug: transitions_for: RESULT for src=%d (method='%s'): {",
-         //     src, method.c_str());
-        for (size_t i = 0; i < out.size(); ++i) {
-          //fprintf(stderr, "%d%s", out[i], (i + 1 < out.size() ? ", " : ""));
+    // 2) Branch rules (ALL options)
+    auto itB = Branch_Rules.find(src);
+    if (itB != Branch_Rules.end()) {
+        any_table_for_src = true;
+
+        for (const auto& br : itB->second) {
+            // br.method is already unqualified typically, but we match both ways anyway
+            bool name_match = (br.method == method) || (br.method == uq);
+            if (!name_match) continue;
+
+            int dst = br.next;
+            if (!seen.count(dst)) {
+                seen.insert(dst);
+                out.push_back(dst);
+            }
         }
-       //printf(stderr, "}\n");
+    }
+
+    // Only error if src truly has no rules anywhere
+    if (!any_table_for_src) {
+        error_at(loc, "Typestate: no rule entry for state %d and method '%s'.",
+                 src, method.c_str());
+        return out;
     }
 
     return out;
 }
-
 
 // 3) Robustly detect if a call feeds this BB's terminator (through SSA wrappers)
 static bool tree_derives_from(tree t, tree base, int depth = 6) {
@@ -2925,13 +3977,19 @@ bool is_inside_if_or_switch(basic_block bb) {
 
 
 
-
-
-
 //  Branch context & strict join 
 
 using Bitset = std::bitset<64>;      
-int NUM_STATES = -1;        // discovered elsewhere
+int NUM_STATES = -1;       
+
+static std::unordered_map<tree, Bitset> g_else_chain_cands;
+static std::unordered_map<tree, std::vector<int>> g_saved_state_stack;
+struct ArmChoiceSet {
+    Bitset tset;
+    Bitset fset;
+};
+
+enum BranchKind { BK_NONE, BK_IF, BK_SWITCH };
 
 struct BranchCtx {
     int expected = 0;
@@ -2944,10 +4002,107 @@ struct BranchCtx {
 
     // final state per arm, per object
     std::unordered_map<tree, std::vector<int>> finals;
+    std::unordered_map<tree, int> sw_current_case_bb; // last case BB index we were in (-1 if none)
+    std::unordered_map<tree, int> sw_active_case_val;   // per object: current case value (-1 for default)
+std::unordered_map<tree, int> sw_active_case_bb;    // per object: current case bb index
+    int guard_pre_state = -1;
+    std::string guard_method;
+
+    Bitset remaining;                 // ELSE-chain candidate states (Bitset)
+    bool remaining_init = false;      // ELSE-chain init flag (bool)
+
+    // Per-object per-ifid candidate sets for TRUE/FALSE successors
+    std::unordered_map<tree, ArmChoiceSet> arm_sets;
+    std::unordered_map<tree, Bitset> active_set;
+
+    std::unordered_map<tree, std::vector<int>> state_stack;
+
+   
+    gimple* sw_term = nullptr;                     // which SWITCH terminator this ctx corresponds to
+    int sw_expected_default = 0;                   // number of switch arms (labels or unique dests)
+
+    // per-object countdown for this switch (key = norm_obj_key(obj))
+    std::unordered_map<tree, int> sw_remaining;
+    std::unordered_map<tree, int> sw_remaining_init;
+
+    // union of end states seen across completed cases (per object)
+    std::unordered_map<tree, Bitset> sw_exit_union;
 };
 
 
  
+static inline tree norm_obj_key(tree t) {
+    t = get_original_object(t);
+    return track_all_aliases(t);
+}
+
+static void push_obj_state(BranchCtx& ctx, tree obj, int s) {
+    tree key = norm_obj_key(obj);
+    ctx.state_stack[key].push_back(s);
+}
+
+static void pop_obj_state(BranchCtx& ctx, tree obj, int &out_s) {
+    tree key = norm_obj_key(obj);
+    auto &stk = ctx.state_stack[key];
+    if (!stk.empty()) {
+        out_s = stk.back();
+        stk.pop_back();
+    }
+}
+
+// Cache "the guard call that produced the variable used in the if-chain"
+// Keyed by (normalized object key).
+static std::unordered_map<tree, int>         LAST_GUARD_PRE;
+static std::unordered_map<tree, std::string> LAST_GUARD_METHOD;
+static std::unordered_map<tree, Bitset>      LAST_GUARD_REMAINING;
+static std::unordered_map<tree, bool>        LAST_GUARD_REMAINING_INIT;
+
+
+static void save_last_guard(tree obj_address, int pre, const std::string& method,
+                            const Bitset* remaining = nullptr, bool remaining_init = false)
+{
+    tree k = norm_obj_key(obj_address);
+    if (!k) return;
+
+    LAST_GUARD_PRE[k] = pre;
+    LAST_GUARD_METHOD[k] = method;
+
+    if (remaining) {
+        LAST_GUARD_REMAINING[k] = *remaining;
+        LAST_GUARD_REMAINING_INIT[k] = remaining_init;
+    }
+
+    fprintf(stderr, "Debug: Save guard origin: objkey=%p pre=%d method=%s\n",
+            (void*)k, pre, method.c_str());
+}
+
+
+static bool load_last_guard(tree obj_address, int &pre_out, std::string &method_out,
+                            Bitset* remaining_out = nullptr, bool* remaining_init_out = nullptr)
+{
+    tree k = norm_obj_key(obj_address);
+    if (!k) return false;
+
+    auto itp = LAST_GUARD_PRE.find(k);
+    auto itm = LAST_GUARD_METHOD.find(k);
+    if (itp == LAST_GUARD_PRE.end() || itm == LAST_GUARD_METHOD.end()) return false;
+
+    pre_out = itp->second;
+    method_out = itm->second;
+
+    if (remaining_out && remaining_init_out) {
+        auto itr = LAST_GUARD_REMAINING.find(k);
+        auto iti = LAST_GUARD_REMAINING_INIT.find(k);
+        if (itr != LAST_GUARD_REMAINING.end() && iti != LAST_GUARD_REMAINING_INIT.end()) {
+            *remaining_out = itr->second;
+            *remaining_init_out = iti->second;
+        }
+    }
+
+    return true;
+}
+
+
 static std::pair<int,int> pick_true_false(const Bitset& bs) {
     int d1 = -1, d2 = -1;
     for (int i = 0; i < (int)bs.size(); ++i) if (bs.test(i)) {
@@ -2967,29 +4122,47 @@ static inline tree norm_obj(tree t) {
     return t;
 }
 
+static inline void record_pre_state(int ifid, tree obj, int pre_state) {
+    BranchCtx& ctx = IFCTX[ifid];
+    if (!ctx.pre.count(obj)) ctx.pre[obj] = pre_state;
+}
+
+
+
 static BranchCtx& ensure_ifctx(int id, gimple* term) {
     auto& ctx = IFCTX[id];
+
+    
     if (ctx.expected == 0 && term) {
         switch (gimple_code(term)) {
-            case GIMPLE_COND:   ctx.expected = 2; break;
+            case GIMPLE_COND:
+                ctx.expected = 2;
+                break;
+
             case GIMPLE_SWITCH: {
                 const gswitch* gs = as_a<const gswitch*>(term);
-                int n = gimple_switch_num_labels(gs);
+                int n = (int)gimple_switch_num_labels(gs);
                 ctx.expected = std::max(1, n);
                 break;
             }
-            default:            ctx.expected = 2; break;
+
+            default:
+                ctx.expected = 2;
+                break;
         }
     }
     if (ctx.expected == 0) ctx.expected = 2;
-    return ctx;
-}
 
-static void record_pre_state(int ifid, tree obj, int pre_state) {
-    auto& ctx = IFCTX[ifid];
-    obj = norm_obj(obj);
-    if (!obj) return;
-    if (!ctx.pre.count(obj)) ctx.pre[obj] = pre_state;
+    // SWITCH-only cache (uses the fields you actually added)
+    if (term && gimple_code(term) == GIMPLE_SWITCH) {
+        if (ctx.sw_term != term) {
+            ctx.sw_term = term;
+            ctx.sw_expected_default = ctx.expected;   // reuse computed expected
+        }
+        if (ctx.sw_expected_default <= 0) ctx.sw_expected_default = ctx.expected;
+    }
+
+    return ctx;
 }
 
 static void record_arm_out_set(int ifid, tree obj, const Bitset& outset) {
@@ -3050,7 +4223,7 @@ static bool edge_is_true_successor(basic_block pred_bb, basic_block bb) {
 }
 
 
-enum CondOp { OP_EQ, OP_NE, OP_OTHER };
+
 
 // Helper: wide-int -> signed host long long using the node's type precision
 static inline long long to_ll_with_prec(const tree t) {
@@ -3132,10 +4305,6 @@ static bool extract_eq_ne_with_const(gimple* term, tree res,
 }
 
 
-static inline tree norm_obj_key(tree t) {
-    t = get_original_object(t);
-    return track_all_aliases(t);
-}
 
 static void record_final_state(int ifid, tree obj, int final_state) {
     auto& ctx = IFCTX[ifid];
@@ -3164,79 +4333,140 @@ void defer_branch_handling(int branch_id_param,
     }
     gimple* term = controlling_terminator_of(bb_here);
 
-    // Recompute the canonical branch id from the terminator; use this id everywhere below
+    // Recompute canonical branch id from the terminator; use this id everywhere
     int branch_id = (term ? get_if_else_id_for_terminator(term) : branch_id_param);
     if (term && branch_id >= 0 && branch_id != branch_id_param) {
         fprintf(stderr,
             "Debug: Branch id mismatch: passed=%d, recomputed=%d. Using recomputed id.\n",
             branch_id_param, branch_id);
+        fflush(stderr);
     }
 
-    // Ensure IFCTX exists for this branch id (sets expected arm count)
+    // Ensure IFCTX exists for this branch id
     if (branch_id >= 0 && term) {
         (void)ensure_ifctx(branch_id, term);
     }
 
-    //  pre-branch state ONCE per (branch_id, object)
+    // Store pre-branch state ONCE per (branch_id, object)
     if (branch_state_map[branch_id].find(obj_key) == branch_state_map[branch_id].end()) {
         if (state_manager.object_states.find(obj_key) == state_manager.object_states.end())
             state_manager.object_states[obj_key] = 0;
         branch_state_map[branch_id][obj_key] = state_manager.object_states[obj_key];
-    //    fprintf(stderr,
-      //      "Debug: Stored pre-branch state for object %p in branch group %d: %d\n",
-         //   (void*)obj_key, branch_id, state_manager.object_states[obj_key]);
     }
     const int pre_branch = branch_state_map[branch_id][obj_key];
 
- 
     if (object_stateper_branch.find(obj_key) == object_stateper_branch.end())
         object_stateper_branch[obj_key] = pre_branch;
 
-    //  Seed once using the stored TRUE/FALSE plan 
+    //  Build missing arm plan on demand 
+    auto build_arm_plan_now = [&](int ifid, tree key_obj, int pre_state, gimple* t) -> bool {
+        if (!t) return false;
+
+        auto& ctx = ensure_ifctx(ifid, t);
+        if (ctx.arm_choice.count(key_obj)) return true;
+
+        // Find guard call producing the value tested by this IF
+        gimple* guard_call = (gimple_code(t) == GIMPLE_COND) ? find_guard_call_for_cond(t) : nullptr;
+        if (!guard_call || !is_gimple_call(guard_call)) return false;
+
+        tree gd = gimple_call_fndecl(guard_call);
+        if (!gd || TREE_CODE(gd) != FUNCTION_DECL || !DECL_NAME(gd)) return false;
+
+        std::string guard_name = demangle(IDENTIFIER_POINTER(DECL_NAME(gd)));
+
+        // Candidates for the guard method from the pre-state
+        std::vector<int> cands = transitions_for(pre_state, guard_name, gimple_location(guard_call));
+        if (cands.empty()) return false;
+
+        auto two = pick_two_arms(cands);
+        std::pair<int,int> choice;
+
+        // Try to read (==/!=) and K from the terminator relative to guard result
+        tree res = gimple_call_lhs(guard_call);
+        CondOp op; long long K; bool res_on_lhs; std::string K_name;
+
+        bool used_map = false;
+        if (res && extract_eq_ne_with_const(t, res, op, K, res_on_lhs, K_name)) {
+            int mapped_eq = branch_next_for_cond(pre_state, guard_name, K);
+            if (mapped_eq >= 0) {
+                int mapped_neq = -1;
+                for (int s : cands) if (s != mapped_eq) { mapped_neq = s; break; }
+                if (mapped_neq < 0) mapped_neq = mapped_eq;
+
+                if (op == OP_EQ) choice = { mapped_eq, mapped_neq };
+                else             choice = { mapped_neq, mapped_eq };
+
+                used_map = true;
+
+                fprintf(stderr,
+                    "Debug: Built plan via Branch_Rules: ifid=%d guard=%s K=%lld op=%s TRUE→%d FALSE→%d pre=%d\n",
+                    ifid, guard_name.c_str(), K, (op == OP_EQ ? "==" : "!="),
+                    choice.first, choice.second, pre_state);
+                fflush(stderr);
+            }
+        }
+
+        if (!used_map) {
+            // Fallback heuristic
+            bool t_true = true_edge_means_call_true(t, guard_call);
+            choice = t_true ? std::make_pair(two.first, two.second)
+                            : std::make_pair(two.second, two.first);
+
+            fprintf(stderr,
+                "Debug: Built plan via fallback: ifid=%d guard=%s TRUE→%d FALSE→%d pre=%d\n",
+                ifid, guard_name.c_str(), choice.first, choice.second, pre_state);
+            fflush(stderr);
+        }
+
+        ctx.arm_choice[key_obj] = choice;
+        return true;
+    };
+    // -----------------------------------------------------------------------
+
+    // Seed once using the stored TRUE/FALSE plan
     if (object_stateper_branch[obj_key] == pre_branch) {
         auto itCtx = IFCTX.find(branch_id);
-        if (itCtx == IFCTX.end()) {
-        //  fprintf(stderr, "Debug: No IFCTX for branch %d; cannot seed.\n", branch_id);
-        } else if (!term) {
-        //  fprintf(stderr, "Debug: No controlling terminator; cannot seed.\n");
-        } else {
+        if (itCtx != IFCTX.end() && term) {
             auto& ctx = itCtx->second;
+
+            // declare iterator BEFORE using it (fixes your compile error)
             auto itPlan = ctx.arm_choice.find(obj_key);
-            
+
+            // If missing, build it now (fixes nested else-if / branch-id gaps)
             if (itPlan == ctx.arm_choice.end()) {
-               fprintf(stderr,
+                (void)build_arm_plan_now(branch_id, obj_key, pre_branch, term);
+                itPlan = ctx.arm_choice.find(obj_key);
+            }
+
+            if (itPlan == ctx.arm_choice.end()) {
+                fprintf(stderr,
                     "Debug: Missing arm plan for object %p in branch %d; staying at pre=%d.\n",
                     (void*)obj_key, branch_id, pre_branch);
+                fflush(stderr);
             } else {
                 bool is_true_arm = edge_is_true_successor(gimple_bb(term), bb_here);
                 int seed = is_true_arm ? itPlan->second.first : itPlan->second.second;
                 if (seed >= 0) {
                     object_stateper_branch[obj_key] = seed;
-                  fprintf(stderr,
-                     "Debug: Entering %s arm (id=%d) for object %p: apply seed=%d "
-                      "(plan TRUE→%d, FALSE→%d), pre=%d.\n",
-                  is_true_arm ? "TRUE" : "FALSE",
-                      branch_id, (void*)obj_key, seed,
-                      itPlan->second.first, itPlan->second.second, pre_branch);
+                    fprintf(stderr,
+                        "Debug: Entering %s arm (id=%d) for object %p: apply seed=%d "
+                        "(plan TRUE→%d, FALSE→%d), pre=%d.\n",
+                        is_true_arm ? "TRUE" : "FALSE",
+                        branch_id, (void*)obj_key, seed,
+                        itPlan->second.first, itPlan->second.second, pre_branch);
+                    fflush(stderr);
                 }
             }
         }
     }
 
-
     int cur = object_stateper_branch[obj_key];
-  //fprintf(stderr,
-   //   "Debug: Entering branch handling for object %p in branch state %d (pre-branch %d) for method '%s'.\n",
-    //  (void*)obj_key, cur, pre_branch, method_name.c_str());
 
     // Compute transitions from the branch-local state
     auto cand = transitions_for(cur, method_name, location);
 
     if (cand.empty()) {
-      //  error_at(location,
-        //    "Debug: No transition applies for '%s' in branch (curr=%d).\n",
-         //   method_name.c_str(), cur, pre_branch);
-       state_manager.method_calls[obj_key].push_back(method_name);
+        state_manager.method_calls[obj_key].push_back(method_name);
         return;
     }
     if (cand.size() > 1) {
@@ -3244,14 +4474,12 @@ void defer_branch_handling(int branch_id_param,
             "Debug: Ambiguous transitions for '%s' in branch state %d (", method_name.c_str(), cur);
         for (int s : cand) fprintf(stderr, "%d ", s);
         fprintf(stderr, "); deferring.\n");
+        fflush(stderr);
         state_manager.method_calls[obj_key].push_back(method_name);
         return;
     }
 
     int next = cand.front();
-  //  fprintf(stderr,
-      //  "Debug: Method '%s' changed branch-local state from %d to %d for object %p.\n",
-      //  method_name.c_str(), cur, next, (void*)obj_key);
     object_stateper_branch[obj_key] = next;
 
     state_manager.method_calls[obj_key].push_back(method_name);
@@ -3305,33 +4533,27 @@ bool check_if_else_completion() {
 }
 
 
-void end_branch_processing(tree obj /*unused but kept for signature compatibility*/) {
-    // Find a representative BB (your current approach)
-    basic_block bb = nullptr;
-    for (basic_block b = ENTRY_BLOCK_PTR_FOR_FN(cfun); b; b = b->next_bb) {
-        gimple_stmt_iterator gsi = gsi_last_bb(b);
-        if (!gsi_end_p(gsi)) bb = b;
-    }
-    if (!bb) return;
+void end_branch_processing(tree obj_key, basic_block arm_bb) {
+    if (!arm_bb) return;
 
-    gimple* term = controlling_terminator_of(bb);
+    // The terminator that controls THIS arm
+    gimple* term = controlling_terminator_of(arm_bb);
     if (!term) return;
 
     int ifid = get_if_else_id_for_terminator(term);
     if (ifid < 0) return;
 
-    // Mark this arm complete (bumps IFCTX[ifid].visited)
+    // Mark this arm complete
     end_arm(ifid);
 
-    
     auto it = IFCTX.find(ifid);
     if (it != IFCTX.end()) {
         auto& ctx = it->second;
 
-        // If all arms have been visited, compare finals for each tracked object
+        // (Optional) Log finals once all arms visited
         if (ctx.visited >= ctx.expected) {
             for (auto& kv : ctx.finals) {
-                tree obj_key = kv.first;
+                tree k = kv.first;
                 const std::vector<int>& finals = kv.second;
 
                 if (!finals.empty()) {
@@ -3342,29 +4564,23 @@ void end_branch_processing(tree obj /*unused but kept for signature compatibilit
                     }
                     if (all_same) {
                         fprintf(stderr,
-                            "Debug: Branch %d: all %d arms end in the SAME state %d for object %p.\n",
-                            ifid, (int)finals.size(), first, (void*)obj_key);
+                            "Debug: Branch %d: all %d arms end in SAME state %d for object %p.\n",
+                            ifid, (int)finals.size(), first, (void*)k);
                     } else {
                         fprintf(stderr,
                             "Debug: Branch %d: arms end in DIFFERENT states for object %p: ",
-                            ifid, (void*)obj_key);
+                            ifid, (void*)k);
                         for (size_t i = 0; i < finals.size(); ++i)
-                            fprintf(stderr, "%s%d", (i?",":""), finals[i]);
+                            fprintf(stderr, "%s%d", (i ? "," : ""), finals[i]);
                         fprintf(stderr, ".\n");
                     }
                 }
             }
         }
     }
-    //END LOGGING BLOCK
 
-    // Now finalize (this may erase IFCTX[ifid])
+    // Finalize the group for this ifid
     try_finalize_if_group(ifid);
-
-    // keep your legacy counters/flags if other parts rely on them
-    // branch_context_map.clear();
-    // is_new_branch = true;
-    // ++current_branch_id;
 }
 
 
@@ -3391,23 +4607,6 @@ static bool both_arms_end_same_state(int ifid, tree obj, int* out_state = nullpt
 
 
 
-
-// hepler Function to get readble C++ names
-std::string demangle(const char* mangled) {
-    if (!mangled || !*mangled) {
-        return "";
-    }
-    int status = 0;
-    char* demangled_name = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
-    std::string result;
-    if (status == 0 && demangled_name) {
-        result = demangled_name;
-        free(demangled_name);
-    } else {
-        result = mangled;
-    }
-    return result;
-}
 
 
 static std::string base_type_org;
@@ -3959,7 +5158,7 @@ void process_function_body(tree function_decl, tree obj_address) {
     push_cfun(fn);
     call_stack.emplace_back();
 g_psa_enabled = true;
-analyze_function_typestate(fn, obj_address);  // your PSA worklist driver
+analyze_function_typestate(fn, obj_address);  
 g_psa_enabled = false;
     // >>> This single call runs the path-sensitive analysis for the one object you passed.
  //   analyze_function_typestate(fn, obj_address);
@@ -4028,7 +5227,7 @@ static void analyze_switch_cases(basic_block switch_bb, gimple *switch_stmt) {
 // Main function to iterate through basic blocks and detect switches
 void Analyse_gimple_in_function(std::unordered_map<tree, tree> param_arg_map = {}) {
 
-    //  detect direct recursion for this function ----------
+    //  detect direct recursion for this function 
     function* fn = cfun;
     if (fn && fn->decl && !g_recursive_fn_decls.count(fn->decl)) {
         bool is_rec = false;
@@ -4060,7 +5259,7 @@ void Analyse_gimple_in_function(std::unordered_map<tree, tree> param_arg_map = {
                    IDENTIFIER_POINTER(DECL_NAME(self)));
         }
     }
-    // ---------- END NEW ----------
+   
 
     call_stack.emplace_back();
     CallContext& context = call_stack.back();
@@ -4114,7 +5313,7 @@ extern tree g_psa_tracked_obj;
 std::unordered_map<int, int> branchExpectedCount; // Expected number of branches for each if-else group.
 std::unordered_map<int, int> branchVisitedCount;
 bool is_if_else_structure_complete(int if_else_id) {
-    // If we haven't set an expected count yet, we can't say it's complete.
+  
     if (branchExpectedCount.find(if_else_id) == branchExpectedCount.end() ||
         branchVisitedCount.find(if_else_id) == branchVisitedCount.end())
     {
@@ -4364,6 +5563,94 @@ static std::unordered_map<tree, int> g_recursion_bounds;
 // Any FUNCTION_DECL in here is known to be directly recursive.
 static std::unordered_set<tree> g_recursive_fn_names;
 
+static int arm_for_bb_under_cond(gimple* cond, basic_block bb) {
+    if (!cond || gimple_code(cond) != GIMPLE_COND) return -1;
+    basic_block cbb = gimple_bb(cond);
+    if (!cbb || !bb) return -1;
+
+    basic_block tbb = nullptr;
+    basic_block fbb = nullptr;
+
+    edge e;
+    edge_iterator ei;
+    FOR_EACH_EDGE(e, ei, cbb->succs) {
+        if (e->flags & EDGE_TRUE_VALUE)  tbb = e->dest;
+        if (e->flags & EDGE_FALSE_VALUE) fbb = e->dest;
+    }
+
+    if (bb == tbb) return 1;
+    if (bb == fbb) return 0;
+
+    calculate_dominance_info(CDI_DOMINATORS);
+
+    // bb is "inside" the arm if it is dominated by the arm entry
+    if (tbb && dominated_by_p(CDI_DOMINATORS, bb, tbb)) return 1;
+    if (fbb && dominated_by_p(CDI_DOMINATORS, bb, fbb)) return 0;
+
+    return -1;
+}
+
+static Bitset bitset_from_vec(const std::vector<int>& v) {
+    Bitset bs;
+    for (int s : v) if (0 <= s && s < (int)bs.size()) bs.set(s);
+    return bs;
+}
+
+static int pick_one_from_bitset(const Bitset& b) {
+    for (int i = 0; i < (int)b.size(); ++i)
+        if (b.test(i)) return i;
+    return -1;
+}
+
+static void init_remaining_for_first_if(BranchCtx& ctx,
+                                        const std::vector<int>& candidates,
+                                        int mapped_true)
+{
+    if (ctx.remaining_init) return;
+
+    ctx.remaining = Bitset(); // assumes default ctor makes correct size
+    for (int s : candidates) {
+        if (0 <= s && s < (int)ctx.remaining.size())
+            ctx.remaining.set(s);
+    }
+
+    // remove the TRUE state => remaining is ELSE side
+    if (0 <= mapped_true && mapped_true < (int)ctx.remaining.size())
+        ctx.remaining.reset(mapped_true);
+
+    ctx.remaining_init = true;
+
+    fprintf(stderr, "Debug: init remaining ELSE-set: remove_true=%d => rem_count=%zu\n",
+            mapped_true, ctx.remaining.count());
+}
+
+// For else-if: FALSE state should come from the remaining set (excluding mapped_true)
+static int compute_false_from_remaining(BranchCtx& ctx, int mapped_true) {
+    if (!ctx.remaining_init) return -1;
+
+    Bitset else_set = ctx.remaining;
+    if (0 <= mapped_true && mapped_true < (int)else_set.size())
+        else_set.reset(mapped_true);
+
+    int f = pick_one_from_bitset(else_set);
+
+    fprintf(stderr, "Debug: else-if narrowing: mapped_true=%d else_count=%zu picked_false=%d\n",
+            mapped_true, else_set.count(), f);
+
+    return f;
+}
+
+
+
+
+// After we test (safe == K) in else-if chain, remove mapped_true from remaining
+static void consume_from_remaining(BranchCtx& ctx, int mapped_true) {
+    if (!ctx.remaining_init) return;
+    if (0 <= mapped_true && mapped_true < (int)ctx.remaining.size())
+        ctx.remaining.reset(mapped_true);
+}
+
+
 static bool is_direct_recursive_call(tree callee_decl) {
     if (!callee_decl || !cfun) return false;
     if (TREE_CODE(callee_decl) != FUNCTION_DECL) return false;
@@ -4449,75 +5736,590 @@ static bool is_recursive_transition_method(const std::string& name) {
 }
 
 
+static bool build_arm_plan_now(int branch_id,
+                               tree obj_key,
+                               int pre_state,
+                               gimple* term)
+{
+    if (!term || !obj_key) return false;
+
+    auto& ctx = ensure_ifctx(branch_id, term);
+    if (ctx.arm_choice.count(obj_key)) return true;
+
+    // Guard call that produced the value tested by this IF
+    gimple* guard_call =
+        (gimple_code(term) == GIMPLE_COND) ? find_guard_call_for_cond(term) : nullptr;
+    if (!guard_call || !is_gimple_call(guard_call)) return false;
+
+    tree gd = gimple_call_fndecl(guard_call);
+    if (!gd || TREE_CODE(gd) != FUNCTION_DECL || !DECL_NAME(gd)) return false;
+
+    // Use a stable name to match your rules
+    std::string guard_name = demangle(IDENTIFIER_POINTER(DECL_NAME(gd)));
+    std::string guard_uq   = unqualified_name(guard_name);
+
+    // Candidates from the pre-state for THIS guard method
+    // (use UNKNOWN_LOCATION here; we are just building a plan)
+    std::vector<int> cands = transitions_for(pre_state, guard_uq, UNKNOWN_LOCATION);
+    if (cands.empty()) {
+        // Try with the full name if unqualified didn't match
+        cands = transitions_for(pre_state, guard_name, UNKNOWN_LOCATION);
+    }
+    if (cands.empty()) return false;
+
+    // Read (==/!=) and K from the IF relative to guard result
+    tree res = gimple_call_lhs(guard_call);
+    if (!res) return false;
+
+    CondOp op; long long K; bool res_on_lhs; std::string K_name;
+
+    auto two = pick_two_arms(cands);
+    std::pair<int,int> choice;
+    bool used_map = false;
+
+    if (extract_eq_ne_with_const(term, res, op, K, res_on_lhs, K_name)) {
+        // Map K to exact next state using Branch_Rules
+        int mapped_eq = branch_next_for_cond(pre_state, guard_uq, K);
+        if (mapped_eq < 0) mapped_eq = branch_next_for_cond(pre_state, guard_name, K);
+
+        if (mapped_eq >= 0) {
+            int mapped_neq = -1;
+            for (int s : cands) {
+                if (s != mapped_eq) { mapped_neq = s; break; }
+            }
+            if (mapped_neq < 0) mapped_neq = mapped_eq;
+
+            if (op == OP_EQ) choice = { mapped_eq, mapped_neq };
+            else             choice = { mapped_neq, mapped_eq };
+
+            used_map = true;
+
+            fprintf(stderr,
+                "Debug: build_arm_plan_now(branch=%d): guard=%s (uq=%s) K=%lld op=%s "
+                "cands=%zu TRUE→%d FALSE→%d pre=%d\n",
+                branch_id,
+                guard_name.c_str(), guard_uq.c_str(),
+                K, (op == OP_EQ ? "==" : "!="),
+                cands.size(),
+                choice.first, choice.second, pre_state);
+            fflush(stderr);
+        }
+    }
+
+    if (!used_map) {
+        // fallback: keep your old two-arm heuristic
+        bool t_true = true_edge_means_call_true(term, guard_call);
+        choice = t_true ? std::make_pair(two.first, two.second)
+                        : std::make_pair(two.second, two.first);
+
+        fprintf(stderr,
+            "Debug: build_arm_plan_now(branch=%d): fallback guard=%s (uq=%s) "
+            "cands=%zu TRUE→%d FALSE→%d pre=%d\n",
+            branch_id,
+            guard_name.c_str(), guard_uq.c_str(),
+            cands.size(),
+            choice.first, choice.second, pre_state);
+        fflush(stderr);
+    }
+
+    ctx.arm_choice[obj_key] = choice;
+    return true;
+}
+
+
 static std::unordered_set<std::string> g_recursive_fn_names_str;
-// ==============================
-//        process_callee_decl
-// ==============================
-void process_callee_decl(tree callee_decl, gimple* stmt) {
 
-    if (!callee_decl || !stmt) return;
-    // Keep the original safety check: we need both
-    // -----------------------------------------------------------
-    // A) Detect once whether this callee is directly recursive
-    //    (i.e., its own body calls itself)
-    // -----------------------------------------------------------
- 
 
-    //std::fprintf(stderr,
-      //  "[DEBUG] Processing call to '%s' from '%s'\n",
-      //  callee_name.c_str(), current_fn_name.c_str());
+std::unordered_map<tree, ArmChoiceSet> arm_choice;
+//std::unordered_map<tree, ArmChoiceSet> arm_sets;     // key = norm_obj_key(obj)
+//std::unordered_map<tree, Bitset>       active_set;   // key = norm_obj_key(obj), set for the BB you're in
 
- //  Recursion: check if callee is a recursive transition and this is an entry call 
-//
-// g_recursive_method_names is a set<string> filled from validate_wcet_vs_timed_rules
-// using the 'method' names from Timed_Typestate_Rules.
 
-// is this call going to a recursive *transition*?
- if (!is_gimple_call(stmt)) {
-        // handle other kinds of statements...
+static std::string tree_name(tree t) {
+    if (!t) return "<null>";
+    t = strip_nops(t);
+
+    if (TREE_CODE(t) == CONST_DECL && DECL_NAME(t)) {
+        const char* r = IDENTIFIER_POINTER(DECL_NAME(t));
+        return r ? std::string(r) : "const_decl";
+    }
+
+    if (TREE_CODE(t) == INTEGER_CST) {
+        long long k = tree_to_shwi(t);
+        return std::to_string(k);
+    }
+
+    if (TREE_CODE(t) == SSA_NAME) {
+        tree v = SSA_NAME_VAR(t);
+        if (v && DECL_NAME(v)) {
+            const char* r = IDENTIFIER_POINTER(DECL_NAME(v));
+            return r ? std::string(r) : "ssa";
+        }
+        return "ssa";
+    }
+
+    if ((TREE_CODE(t) == VAR_DECL || TREE_CODE(t) == PARM_DECL) && DECL_NAME(t)) {
+        const char* r = IDENTIFIER_POINTER(DECL_NAME(t));
+        return r ? std::string(r) : "var";
+    }
+
+    return std::string(get_tree_code_name(TREE_CODE(t)));
+}
+
+static const char* cond_code_name(enum tree_code code) {
+    switch (code) {
+        case EQ_EXPR: return "==";
+        case NE_EXPR: return "!=";
+        case LT_EXPR: return "<";
+        case LE_EXPR: return "<=";
+        case GT_EXPR: return ">";
+        case GE_EXPR: return ">=";
+        default: return "?";
+    }
+}
+
+static void debug_dump_branch_rules(int pre, const std::string& method) {
+    const std::string uq = unqualified_name(method);
+
+    fprintf(stderr, "Debug: Branch_Rules dump for pre=%d method=%s (uq=%s):\n",
+            pre, method.c_str(), uq.c_str());
+
+    auto itB = Branch_Rules.find(pre);
+    if (itB == Branch_Rules.end()) {
+        fprintf(stderr, "  (none for this pre state)\n");
+        return;
+    }
+    for (const auto& br : itB->second) {
+        bool name_match = (br.method == method) || (br.method == uq);
+        if (!name_match) continue;
+
+        fprintf(stderr, "  cond=%d -> next=%d (stored method=%s)\n",
+                br.cond, br.next, br.method.c_str());
+    }
+}
+
+
+static void debug_print_condition(gimple* cond, const char* tag, int ifid) {
+    if (!cond || gimple_code(cond) != GIMPLE_COND) {
+        fprintf(stderr, "Debug[%s]: ifid=%d cond=<not GIMPLE_COND>\n", tag, ifid);
         return;
     }
 
-   tree callee = gimple_call_fndecl(stmt);
-    if (!callee || TREE_CODE(callee) != FUNCTION_DECL)
+    tree lhs = strip_nops(gimple_cond_lhs(cond));
+    tree rhs = strip_nops(gimple_cond_rhs(cond));
+    enum tree_code cc = gimple_cond_code(cond);
+
+    fprintf(stderr, "Debug[%s]: ifid=%d cond=(%s %s %s)\n",
+            tag, ifid,
+            tree_name(lhs).c_str(),
+            cond_code_name(cc),
+            tree_name(rhs).c_str());
+}
+
+
+static bool cond_compares_var_to_const(gimple* cond_stmt, tree &var_out, CondOp &op_out, int &K_out) {
+    if (!cond_stmt || gimple_code(cond_stmt) != GIMPLE_COND) return false;
+
+    enum tree_code code = gimple_cond_code(cond_stmt);
+    if (code != EQ_EXPR && code != NE_EXPR) return false;
+
+    op_out = (code == EQ_EXPR) ? OP_EQ : OP_NE;
+
+    tree lhs = strip_nops(gimple_cond_lhs(cond_stmt));
+    tree rhs = strip_nops(gimple_cond_rhs(cond_stmt));
+
+    // One side must be "a variable-ish thing", other must be const/enum
+    int K;
+    if (get_const_int(rhs, K)) { var_out = lhs; K_out = K; return true; }
+    if (get_const_int(lhs, K)) { var_out = rhs; K_out = K; return true; }
+
+    return false;
+}
+
+static bool cond_var_and_const(gimple* cond, tree &var_out, CondOp &op_out, int &K_out) {
+    if (!cond || gimple_code(cond) != GIMPLE_COND) return false;
+
+    enum tree_code code = gimple_cond_code(cond);
+    if (code == EQ_EXPR) op_out = OP_EQ;
+    else if (code == NE_EXPR) op_out = OP_NE;
+    else return false;
+
+    tree lhs = strip_nops(gimple_cond_lhs(cond));
+    tree rhs = strip_nops(gimple_cond_rhs(cond));
+
+    int K;
+    if (get_const_int(rhs, K)) { var_out = lhs; K_out = K; return true; }
+    if (get_const_int(lhs, K)) { var_out = rhs; K_out = K; return true; }
+    return false;
+}
+
+static std::string guard_name_from_ssa(tree v) {
+    v = strip_nops(v);
+    if (!v || TREE_CODE(v) != SSA_NAME) return "<unknown>";
+
+    gimple* def = SSA_NAME_DEF_STMT(v);
+    if (!def || !is_gimple_call(def)) return "<unknown>";
+
+    tree gd = gimple_call_fndecl(def);
+    if (!gd || !DECL_NAME(gd)) return "<unknown>";
+
+    return demangle(IDENTIFIER_POINTER(DECL_NAME(gd)));
+}
+
+
+static void ensure_guard_origin(BranchCtx &ctx, tree obj_address) {
+    if (ctx.guard_pre_state >= 0 && !ctx.guard_method.empty())
         return;
- //std::fprintf(stderr, "[pcd] process_callee_decl called\n");
 
-    if (!callee_decl || TREE_CODE(callee_decl) != FUNCTION_DECL)
+    int pre = -1;
+    std::string meth;
+    if (load_last_guard(obj_address, pre, meth)) {
+        ctx.guard_pre_state = pre;
+        ctx.guard_method = meth;
+
+        fprintf(stderr, "Debug: Inherit guard origin: pre=%d method=%s\n",
+                ctx.guard_pre_state, ctx.guard_method.c_str());
+    } else {
+        fprintf(stderr, "Debug: No guard origin available to inherit.\n");
+    }
+}
+
+
+
+static int first_set_bit(const Bitset& b) {
+    for (int i = 0; i < (int)b.size(); ++i) {
+        if (b.test(i)) return i;
+    }
+    return -1;
+}
+
+
+
+static tree switch_index_from_stmt(gimple* sw) {
+    const gswitch* gs = as_a<const gswitch*>(sw);
+    return gimple_switch_index(gs);
+}
+
+// Returns true if bb is one of the switch destinations.
+// If it’s default, is_default_out=true (case_value_out ignored).
+static bool switch_case_value_for_bb(gimple* sw,
+                                     basic_block bb,
+                                     int &case_value_out,
+                                     bool &is_default_out)
+{
+    const gswitch* gs = as_a<const gswitch*>(sw);
+    unsigned n = gimple_switch_num_labels(gs);
+
+    for (unsigned i = 0; i < n; ++i) {
+        tree lab = gimple_switch_label(gs, i);
+        if (!lab) continue;
+
+        // In GCC, switch labels are usually CASE_LABEL_EXPR.
+        // label_to_block wants the LABEL_DECL (CASE_LABEL(lab)).
+        tree tgt = lab;
+        if (TREE_CODE(lab) == CASE_LABEL_EXPR && CASE_LABEL(lab))
+            tgt = CASE_LABEL(lab);
+
+        basic_block dest = label_to_block(cfun, tgt);
+
+        // Fallback: some forms might already be a label-like node
+        if (dest != bb) {
+             basic_block dest2 = label_to_block(cfun, lab);
+            fprintf(stderr,
+         //   "Debug: SWITCH match? cur_bb=%d lab_code=%s tgt_code=%s dest=%d alt_dest=%d\n",
+         //   bb->index,
+            get_tree_code_name(TREE_CODE(lab)),
+            get_tree_code_name(TREE_CODE(tgt)),
+            dest ? dest->index : -1,
+            dest2 ? dest2->index : -1);
+          
+            if (dest2 != bb) continue;
+        }
+
+        tree low = CASE_LOW(lab);   // default has no CASE_LOW
+        if (!low) {
+            is_default_out = true;
+            return true;
+        }
+
+        if (TREE_CODE(low) == INTEGER_CST) {
+            case_value_out = (int)tree_to_shwi(low);
+            is_default_out = false;
+            return true;
+        }
+
+        // Not a simple integer case (range case etc.)
+        return false;
+    }
+
+    return false;
+}
+
+// handle_switch_entry:
+// - seeds the case state
+// - ALWAYS pushes incoming state to ctx.state_stack[key] so restore works
+// - stores "active case value" so we can finalize later
+// - does NOT rely on g_saved_state_stack
+// - uses %lu not %zu
+//
+//   std::unordered_map<tree, int> sw_active_case_val;   // current case value for this object (or -1 for default)
+//   std::unordered_map<tree, int> sw_active_case_bb;    // current case BB index for this object
+
+
+static void handle_switch_entry(gimple* sw, basic_block bb, tree obj_address)
+{
+    if (!sw || gimple_code(sw) != GIMPLE_SWITCH) return;
+
+    int ifid = get_if_else_id_for_terminator(sw);
+    BranchCtx& ctx = ensure_ifctx(ifid, sw);
+
+    tree key = norm_obj_key(obj_address);
+
+    // Must know which guard call produced the switch value and the pre-state
+    ensure_guard_origin(ctx, obj_address);
+
+    int pre = ctx.guard_pre_state;
+    const std::string& gname = ctx.guard_method;
+
+    if (pre < 0 || gname.empty()) {
+        fprintf(stderr, "Debug: SWITCH: no guard origin (ifid=%d)\n", ifid);
         return;
+    }
 
-    const char* raw_name = IDENTIFIER_POINTER(DECL_NAME(callee_decl));
-    std::string callee_name(raw_name);   // e.g. "Robot::AdjustActuators"
+    int case_val = 0;
+    bool is_default = false;
 
-    // print every call we see at least once
-   // std::fprintf(stderr, "[pcd]  saw call to '%s'\n", callee_name.c_str());
+    if (!switch_case_value_for_bb(sw, bb, case_val, is_default)) {
+        fprintf(stderr,
+                "Debug: SWITCH: could not match BB to a case/default (ifid=%d bb=%d)\n",
+                ifid, bb ? bb->index : -1);
+        return;
+    }
 
-    // normalize to base name so it matches the typestate method "AdjustActuators"
+    // Candidate transitions from pre under this guard method
+    std::vector<int> candidates =
+        transitions_for(pre, gname, gimple_location(sw));
+
+    Bitset possible;
+    possible.reset();
+
+    if (!is_default) {
+        int mapped = branch_next_for_cond(pre, gname, case_val);
+        if (mapped >= 0 && mapped < (int)possible.size()) {
+            possible.set(mapped);
+        } else {
+            fprintf(stderr,
+                "Debug: SWITCH: no mapping for case=%d (pre=%d guard=%s)\n",
+                case_val, pre, gname.c_str());
+        }
+    } else {
+        // default: conservative (all candidates)
+        for (int s : candidates)
+            if (0 <= s && s < (int)possible.size()) possible.set(s);
+    }
+
+    // Save the case candidate set for this BB
+    ctx.active_set[key] = possible;
+
+    // Record which case we are in (for later finalization)
+    ctx.sw_active_case_val[key] = is_default ? -1 : case_val;
+    ctx.sw_active_case_bb[key]  = bb ? bb->index : -1;
+
+    // IMPORTANT:  save incoming state for this arm, so we can restore later.
+    {
+        int prev = 0;
+        auto itPrev = state_manager.object_states.find(obj_address);
+        if (itPrev != state_manager.object_states.end()) prev = itPrev->second;
+        ctx.state_stack[key].push_back(prev);
+    }
+
+    // Apply singleton state (if known)
+    if (possible.count() == 1) {
+        int next_state = first_set_bit(possible);
+        if (next_state >= 0) {
+            state_manager.object_states[obj_address] = next_state;
+        }
+    }
+
+    fprintf(stderr,
+        "Debug: SWITCH enter ifid=%d obj=%p bb=%d case=%s possible_count=%lu\n",
+        ifid, (void*)obj_address,
+        bb ? bb->index : -1,
+        is_default ? "default" : std::to_string(case_val).c_str(),
+        (unsigned long)possible.count());
+}
+
+
+// Returns true if SWITCH index is the call result, possibly through 1-2 SSA copies.
+static bool call_feeds_switch_index(gimple* call_stmt, gimple* term_switch) {
+    if (!call_stmt || !term_switch) return false;
+    if (!is_gimple_call(call_stmt)) return false;
+    if (gimple_code(term_switch) != GIMPLE_SWITCH) return false;
+
+    const gswitch* gs = as_a<const gswitch*>(term_switch);
+    tree idx = strip_nops(gimple_switch_index(gs));
+    tree lhs = gimple_call_lhs(call_stmt);
+    if (!lhs) return false;
+    lhs = strip_nops(lhs);
+
+    // Direct: switch(idx) where idx == call lhs
+    if (idx && operand_equal_p(idx, lhs, 0)) return true;
+
+    // If idx is SSA_NAME, look at its def:
+    if (idx && TREE_CODE(idx) == SSA_NAME) {
+        gimple* def = SSA_NAME_DEF_STMT(idx);
+        if (!def) return false;
+
+        // Common: idx = lhs (GIMPLE_ASSIGN)
+        if (gimple_code(def) == GIMPLE_ASSIGN) {
+            tree rhs1 = strip_nops(gimple_assign_rhs1(def));
+            if (rhs1 && operand_equal_p(rhs1, lhs, 0)) return true;
+
+            // Sometimes: idx = (NOP) lhs
+            // strip_nops above already handles most of this.
+        }
+
+        // Sometimes the switch index SSA is *directly* defined by the call
+        if (is_gimple_call(def)) {
+            tree def_lhs = gimple_call_lhs(def);
+            if (def_lhs && operand_equal_p(strip_nops(def_lhs), lhs, 0))
+                return true;
+        }
+    }
+
+    return false;
+}
+//
+
+static bool is_end_of_switch_case_bb(basic_block bb) {
+    if (!bb) return false;
+
+    gimple_stmt_iterator it = gsi_last_bb(bb);
+    if (gsi_end_p(it)) return false;
+
+    gimple* last = gsi_stmt(it);
+    if (!last) return false;
+
+    // break; is typically a GOTO to the join label
+    if (gimple_code(last) == GIMPLE_GOTO) return true;
+
+    // return; also ends an arm
+    if (gimple_code(last) == GIMPLE_RETURN) return true;
+
+    return false;
+}
+
+static void end_switch_case_processing(BranchCtx& ctx,
+                                       tree key,
+                                       tree obj_address,
+                                       int arm_end_state,
+                                       location_t loc)
+{
+    Bitset &u = ctx.sw_exit_union[key];
+    if (0 <= arm_end_state && arm_end_state < (int)u.size())
+        u.set(arm_end_state);
+
+    // FAIL FAST: as soon as we see >1 end-state
+    if (u.count() > 1) {
+        error_at(loc,
+                 "Typestate: switch cases end in different states (count=%lu).",
+                 (unsigned long)u.count());
+        return;
+    }
+
+    // countdown
+    auto it = ctx.sw_remaining.find(key);
+    if (it == ctx.sw_remaining.end()) ctx.sw_remaining[key] = 0;
+    else it->second--;
+
+    if (ctx.sw_remaining[key] <= 0) {
+        // u.count() is 1 here
+        int final_state = first_set_bit(u);
+        if (final_state >= 0) state_manager.object_states[obj_address] = final_state;
+
+        ctx.sw_exit_union.erase(key);
+        ctx.sw_remaining.erase(key);
+        ctx.sw_remaining_init.erase(key);
+    }
+}
+
+static void finalize_switch_if_exited(tree obj_address, basic_block bb, location_t loc)
+{
+    // If still inside a switch arm, do nothing
+    gimple* ctl = controlling_terminator_of(bb);
+    if (ctl && gimple_code(ctl) == GIMPLE_SWITCH) return;
+
+    //  NOT in a switch-controlled BB. If there is a pending switch for this object, finalize it.
+
+    tree key = norm_obj_key(obj_address);
+
+    int pre = -1;
+    std::string meth;
+    if (!load_last_guard(obj_address, pre, meth)) return; // no active guard/switch tracked
+
+    // Find the BranchCtx for the most recent switch terminator ifid.
+    //  can’t get ifid directly from load_last_guard, so use the only active switch ctx:
+    // heuristic: scan IFCTX for a ctx where sw_remaining has this key.
+    for (auto &kv : IFCTX) {
+        BranchCtx &ctx = kv.second;
+
+        auto itR = ctx.sw_remaining.find(key);
+        if (itR == ctx.sw_remaining.end()) continue; // not active
+
+        // Finalize the *current* last case using current state
+        int arm_end_state = 0;
+        auto itS = state_manager.object_states.find(obj_address);
+        if (itS != state_manager.object_states.end()) arm_end_state = itS->second;
+
+        fprintf(stderr,
+                "Debug: SWITCH EXIT finalize obj=%p end_state=%d remaining=%d\n",
+                (void*)obj_address, arm_end_state, itR->second);
+
+        //  finalize one arm here (the last one) because we just exited the switch region.
+        end_switch_case_processing(ctx, key, obj_address, arm_end_state, loc);
+
+        // Also clear “current case bb” tracker if you have it
+        if (ctx.sw_current_case_bb.count(key)) ctx.sw_current_case_bb.erase(key);
+
+        break; // only one active switch per object expected
+    }
+}
+
+
+// ------------------------------------------------------------
+// FULL process_callee_decl 
+// ------------------------------------------------------------
+void process_callee_decl(tree callee_decl, gimple* stmt) {
+    if (!callee_decl || !stmt) return;
+    if (!is_gimple_call(stmt)) return;
+
+    tree callee = gimple_call_fndecl(stmt);
+    if (!callee || TREE_CODE(callee) != FUNCTION_DECL) return;
+    if (TREE_CODE(callee_decl) != FUNCTION_DECL) return;
+
+    const char* raw_name =
+        (DECL_NAME(callee_decl) ? IDENTIFIER_POINTER(DECL_NAME(callee_decl)) : nullptr);
+    std::string callee_name(raw_name ? raw_name : "");
+
+    // Normalize base name "Class::foo" -> "foo"
     std::string base_name = callee_name;
-    auto pos = base_name.rfind("::");
-    if (pos != std::string::npos)
+    if (auto pos = base_name.rfind("::"); pos != std::string::npos)
         base_name = base_name.substr(pos + 2);
 
-    //std::fprintf(stderr, "[pcd]  base name = '%s'\n", base_name.c_str());
-
-  
-
-
-    
+    // ==================================================
+    // (A) inter-proc "dive"
+    // ==================================================
     {
-        // 1) Basic prep like in the second version
         unsigned nargs = gimple_call_num_args(stmt);
         tree flagged_tmp = nullptr;
         tree first_obj = nullptr;
         tree dive_obj  = nullptr;
 
-        // 2) Determine if it's a non-static member call
         bool is_member =
             DECL_CONTEXT(callee_decl) &&
             TREE_CODE(DECL_CONTEXT(callee_decl)) == RECORD_TYPE &&
             !DECL_STATIC_FUNCTION_P(callee_decl);
 
-      
         if (nargs >= 1) {
             tree arg0 = gimple_call_arg(stmt, 0);
             if (arg0 && is_object_of_Flagged(arg0, flagged_tmp)) {
@@ -4525,9 +6327,7 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
             }
         }
 
-        // 4) Decide the "dive object" policy (mirrors your second version)
         if (is_member) {
-            // Member call: prefer a flagged 2nd argument (arg1) as the inter-proc anchor
             if (nargs >= 2) {
                 tree arg1 = gimple_call_arg(stmt, 1);
                 if (arg1 && is_object_of_Flagged(arg1, flagged_tmp)) {
@@ -4535,32 +6335,19 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
                 }
             }
         } else {
-            // Free/static call: fall back to first_obj (flagged arg0)
             dive_obj = first_obj;
         }
 
-        // 5) If we found a dive_obj, build an analyzed-context key and possibly dive
         if (dive_obj) {
-            // Compute current state for the dive object (or -1 if unknown)
             int in_state = -1;
             if (auto it = state_manager.object_states.find(dive_obj);
                 it != state_manager.object_states.end())
-            {
                 in_state = it->second;
-            }
 
-            AnalysisContextKey key{
-                callee_decl,
-                dive_obj,
-                in_state,
-                "" // optional tag/channel; keep empty as in your second version
-            };
+            AnalysisContextKey key{ callee_decl, dive_obj, in_state, "" };
 
-            // Guard against re-entrancy / infinite recursion
             if (analyzed_contexts.insert(key).second) {
-                // Build ParamMap (formal -> canonical actual), like your second version
                 ParamMap p2a;
-                // Iterate formals alongside indices
                 tree formal = DECL_ARGUMENTS(callee_decl);
                 for (unsigned idx = 0; idx < nargs && formal; ++idx, formal = TREE_CHAIN(formal)) {
                     tree actual = gimple_call_arg(stmt, idx);
@@ -4568,14 +6355,12 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
                     p2a[formal] = canon;
                 }
 
-                // (Optional) If operator-> on a tracked "dive_obj", propagate alias (non-destructive)
                 if (callee_name == "operator->") {
                     if (tree lhs = gimple_call_lhs(stmt)) {
                         state_manager.register_alias(lhs, dive_obj);
                     }
                 }
 
-                // If the callee has a body, we can perform an inter-procedural dive now.
                 if (gimple_has_body_p(callee_decl)) {
                     if (function* fn = DECL_STRUCT_FUNCTION(callee_decl)) {
                         push_cfun(fn);
@@ -4583,20 +6368,15 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
                         pop_cfun();
                     }
                 }
-             
             }
-            
         }
     }
-    // ----------------------------------------------------------------------
-    //  "especially analyzed context" coverage
-    // ----------------------------------------------------------------------
 
-    //Original: member functions only 
-    if (TREE_CODE(callee_decl) == FUNCTION_DECL &&
-        DECL_CONTEXT(callee_decl) &&
-        TREE_CODE(DECL_CONTEXT(callee_decl)) == RECORD_TYPE)
-    {
+    // ==================================================
+    // (B) Typestate enforcement
+    // ==================================================
+    if (DECL_CONTEXT(callee_decl) && TREE_CODE(DECL_CONTEXT(callee_decl)) == RECORD_TYPE) {
+
         // class gate
         std::string class_name;
         if (tree cls = DECL_CONTEXT(callee_decl)) {
@@ -4607,18 +6387,17 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
         }
         if (class_name != TypestateClassConnector_args[0]) goto PARAMS;
 
-        // 'this'
+        // this
         tree this_arg = NULL_TREE;
         if (!DECL_STATIC_FUNCTION_P(callee_decl))
             this_arg = gimple_call_arg(stmt, 0);
         if (!this_arg) goto PARAMS;
 
-        // normalize object once
         this_arg = get_original_object(this_arg);
         this_arg = track_all_aliases(this_arg);
         if (!this_arg) goto PARAMS;
 
-        // operator-> : alias only
+        // operator-> alias only
         if (callee_name == "operator->") {
             if (tree lhs = gimple_call_lhs(stmt)) {
                 state_manager.register_alias(lhs, this_arg);
@@ -4626,275 +6405,494 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
             goto PARAMS;
         }
 
-        // ensure it's a tracked object (base or subtype)
+        // tracked object
         tree obj_address = NULL_TREE;
         if (!is_object_of_Flagged(this_arg, obj_address)) goto PARAMS;
 
-        // ensure current state
-        int current_state = 0;
-        if (auto it = state_manager.object_states.find(obj_address);
-            it != state_manager.object_states.end())
-            current_state = it->second;
-        else
-            state_manager.object_states[obj_address] = current_state;
-
-        // basic block / terminator
         basic_block bb = gimple_bb(stmt);
         gimple_stmt_iterator tail = gsi_last_bb(bb);
         gimple* term = gsi_end_p(tail) ? nullptr : gsi_stmt(tail);
 
-        // decide guarded path
-        bool returns_guarded = method_returns_boolean_or_enum(callee_decl);
-        bool feeds_cond = call_feeds_terminator_cond(stmt, term);
-
-        if (returns_guarded || feeds_cond) {
-            // candidate next states from current_state for THIS method
-            std::vector<int> candidates = transitions_for(current_state, callee_name, gimple_location(stmt));
-
-            // bitset for merge infra
-            Bitset outset;
-            for (int s : candidates) if (0 <= s && s < (int)outset.size()) outset.set(s);
-
-            //  Case A: this call feeds THIS BB's GIMPLE_COND
-            if (call_feeds_terminator_cond(stmt, term)) {
-                int ifid = get_if_else_id_for_terminator(term);
-                auto& ctx = ensure_ifctx(ifid, term);
-
-                // Candidates for THIS method
-                std::vector<int> candidates2 =
-                    transitions_for(current_state, callee_name, gimple_location(stmt));
-
-                // Record for merge bookkeeping
-                record_pre_state(ifid, obj_address, current_state);
-                Bitset outset2; for (int s : candidates2) if (0 <= s && s < (int)outset2.size()) outset2.set(s);
-                record_arm_out_set(ifid, obj_address, outset2);
-
-                tree key = norm_obj_key(obj_address);
-                if (!ctx.arm_choice.count(key)) {
-                    auto two = pick_two_arms(candidates2);
-                    tree res = gimple_call_lhs(stmt);
-
-                    CondOp op; long long K; bool res_on_lhs; std::string K_name;
-                    std::pair<int,int> choice;
-
-                    if (extract_eq_ne_with_const(term, res, op, K, res_on_lhs, K_name)) {
-                        if (op == OP_EQ) {
-                            choice = (K == 0)
-                                ? std::make_pair(two.second, two.first)
-                                : std::make_pair(two.first,  two.second);
-                        } else { // OP_NE
-                            choice = (K == 0)
-                                ? std::make_pair(two.second, two.first)
-                                : std::make_pair(two.first,  two.second);
-                        }
-                    } else {
-                        // Fallback
-                        bool t_true = true_edge_means_call_true(term, stmt);
-                        choice = t_true ? std::make_pair(two.first, two.second)
-                                        : std::make_pair(two.second, two.first);
-                        fprintf(stderr,
-                            "Debug: Fallback plan. two={%d,%d}. PLAN TRUE→%d, FALSE→%d (ifid=%d).\n",
-                            two.first, two.second, choice.first, choice.second, ifid);
-                    }
-
-                    ctx.arm_choice[key] = choice;
-                }
-                int next = -1; for (int i = 0; i < (int)outset.size(); ++i) if (outset.test(i)) { next = i; break; }
-                state_manager.object_states[obj_address] = next;
-                end_branch_processing(obj_address);
-                return;
-            }
-
-            //  Case B: already in successor arm (use predecessor's COND & the GUARD call)
-            {
-                gimple* pred_term = controlling_terminator_of(bb); // the COND that led here
-                int ifid = pred_term ? get_if_else_id_for_terminator(pred_term)
-                                     : get_if_else_id_for_bb(bb);
-
-                auto& ctx = ensure_ifctx(ifid, pred_term);
-
-                // Record pre/outset from THIS call (for merge bookkeeping)
-                std::vector<int> candidates2 =
-                    transitions_for(current_state, callee_name, gimple_location(stmt));
-                record_pre_state(ifid, obj_address, current_state);
-                Bitset outset2; for (int s : candidates2) if (0 <= s && s < (int)outset2.size()) outset2.set(s);
-                record_arm_out_set(ifid, obj_address, outset2);
-
-                tree key = norm_obj_key(obj_address);
-                if (!ctx.arm_choice.count(key)) {
-                    // Find the GUARD call whose result the predecessor COND tested
-                    gimple* guard_call = (pred_term && gimple_code(pred_term) == GIMPLE_COND)
-                                       ? find_guard_call_for_cond(pred_term)
-                                       : nullptr;
-
-                    // Prefer guard method’s transitions; else fall back to current candidates
-                    std::vector<int> seed_cands;
-                    std::string guard_name = "<unknown>";
-                    if (guard_call && is_gimple_call(guard_call)) {
-                        if (tree gd = gimple_call_fndecl(guard_call)) {
-                            if (DECL_NAME(gd)) guard_name = demangle(IDENTIFIER_POINTER(DECL_NAME(gd)));
-                        }
-                        seed_cands = transitions_for(current_state, guard_name, gimple_location(guard_call));
-                    } else {
-                        seed_cands = candidates2;
-                    }
-
-                    auto two = pick_two_arms(seed_cands);
-                    std::pair<int,int> choice;
-
-                    if (guard_call) {
-                        // Read (==/!=) and K from the predecessor COND relative to GUARD result
-                        tree res = gimple_call_lhs(guard_call);
-                        CondOp op; long long K; bool res_on_lhs; std::string K_name;
-
-                        if (extract_eq_ne_with_const(pred_term, res, op, K, res_on_lhs, K_name)) {
-                            if (op == OP_EQ) {
-                                choice = (K == 0)
-                                    ? std::make_pair(two.second, two.first)
-                                    : std::make_pair(two.first,  two.second);
-                            } else { // OP_NE
-                                choice = (K == 0)
-                                    ? std::make_pair(two.first,  two.second)
-                                    : std::make_pair(two.second, two.first);
-                            }
-                        } else {
-                            // Fallback if pattern isn’t simple eq/ne with const
-                            bool t_true = true_edge_means_call_true(pred_term, guard_call);
-                            choice = t_true ? std::make_pair(two.first, two.second)
-                                            : std::make_pair(two.second, two.first);
-                            fprintf(stderr,
-                                "Debug: GUARD fallback. two={%d,%d}. PLAN TRUE→%d, FALSE→%d (ifid=%d).\n",
-                                two.first, two.second, choice.first, choice.second, ifid);
-                        }
-                    } else {
-                        // No guard found — fallback using current stmt vs pred_term
-                        bool t_true = true_edge_means_call_true(pred_term, stmt);
-                        choice = t_true ? std::make_pair(two.first, two.second)
-                                        : std::make_pair(two.second, two.first);
-                        fprintf(stderr,
-                            "Debug: No guard; fallback. two={%d,%d}. PLAN TRUE→%d, FALSE→%d (ifid=%d).\n",
-                            two.first, two.second, choice.first, choice.second, ifid);
-                    }
-
-                    ctx.arm_choice[key] = choice;
-                }
-                end_branch_processing(key);
-                int next = -1; for (int i = 0; i < (int)outset.size(); ++i) if (outset.test(i)) { next = i; break; }
-                state_manager.object_states[obj_address] = next;
-                return;
-            }
-
-            //  Case C: straight-line (no branch)
-            if (outset.count() != 1) {
-                error_at(gimple_location(stmt),
-                         "Typestate: call '%s' yields multiple possible next states outside a branch.",
-                         callee_name.c_str());
-                return;
-            }
-
-            return;
-        }
-   
-
-        //  NON-GUARDED path
+        // --------------------------
+        // DEBUG: print every call encountered
+        // --------------------------
         {
-            // If this BB belongs to an if/switch arm, always defer (never straight-line inside an arm)
+            int st = 0;
+            auto itS = state_manager.object_states.find(obj_address);
+            if (itS != state_manager.object_states.end()) st = itS->second;
+            printf("\n[CALL] bb=%d term=%d callee=%s obj=%p state=%d\n",
+                   bb ? bb->index : -1,
+                   term ? (int)gimple_code(term) : -1,
+                   callee_name.c_str(),
+                   (void*)obj_address,
+                   st);
+        }
+
+        // Helper: extract integer constant K from a GIMPLE_COND (either side).
+        auto extract_int_const_from_cond = [&](gimple* cond, int& K_out) -> bool {
+            if (!cond || gimple_code(cond) != GIMPLE_COND) return false;
+            const gcond* gc = as_a<const gcond*>(cond);
+            tree lhs = strip_nops(gimple_cond_lhs(gc));
+            tree rhs = strip_nops(gimple_cond_rhs(gc));
+
+            auto getK = [&](tree t) -> bool {
+                if (!t) return false;
+                if (TREE_CODE(t) == INTEGER_CST) {
+                    K_out = (int)TREE_INT_CST_LOW(t);
+                    return true;
+                }
+                return false;
+            };
+
+            return getK(lhs) || getK(rhs);
+        };
+
+        // Helper: synthesize ctx.arm_sets for IF that is part of else-if chain
+        // using last_guard (pre-state + method) and cond constant K.
+        auto synthesize_if_arm_sets_from_last_guard = [&](BranchCtx& ctx, tree key, gimple* cond_term) -> bool {
+            int pre = -1;
+            std::string meth;
+            if (!load_last_guard(obj_address, pre, meth)) {
+                printf("           [SYNTH] load_last_guard FAILED\n");
+                return false;
+            }
+            if (pre < 0 || meth.empty()) {
+                printf("           [SYNTH] last_guard invalid pre=%d meth='%s'\n", pre, meth.c_str());
+                return false;
+            }
+
+            int K = 0;
+            if (!extract_int_const_from_cond(cond_term, K)) {
+                printf("           [SYNTH] could not extract const K from cond\n");
+                return false;
+            }
+
+            // candidates from pre under the guard method
+            std::vector<int> candidates = transitions_for(pre, meth, gimple_location(cond_term));
+
+            // map for (pre, meth, K) -> mapped state (true arm)
+            int mapped = branch_next_for_cond(pre, meth, K);
+
+            ArmChoiceSet sets;
+            sets.tset.reset();
+            sets.fset.reset();
+
+            auto set_all_candidates = [&](Bitset& out) {
+                for (int s : candidates)
+                    if (0 <= s && s < (int)out.size()) out.set(s);
+            };
+
+            if (mapped >= 0 && mapped < (int)sets.tset.size()) {
+                sets.tset.set(mapped);
+            } else {
+                // if mapping fails, be conservative: true arm could be any candidate
+                set_all_candidates(sets.tset);
+                printf("           [SYNTH] mapping FAILED for K=%d; using conservative tset\n", K);
+            }
+
+            // false arm: all candidates except mapped (or all if mapped invalid)
+            if (mapped >= 0) {
+                for (int s : candidates) {
+                    if (s < 0 || s >= (int)sets.fset.size()) continue;
+                    if (s == mapped) continue;
+                    sets.fset.set(s);
+                }
+                // if mapped was the only candidate, keep false as mapped (avoid empty)
+                if (sets.fset.count() == 0 && sets.tset.count() == 1) sets.fset = sets.tset;
+            } else {
+                set_all_candidates(sets.fset);
+            }
+
+            // install in this ctx (ifid)
+            ctx.arm_sets[key] = sets;
+
+            // also update ctx guard origin for debugging clarity
+            ctx.guard_pre_state = pre;
+            ctx.guard_method = meth;
+
+            printf("           [SYNTH] created arm_sets from last_guard: pre=%d meth=%s K=%d mapped=%d (t=%lu f=%lu)\n",
+                   pre, meth.c_str(), K, mapped,
+                   (unsigned long)sets.tset.count(),
+                   (unsigned long)sets.fset.count());
+            return true;
+        };
+
+        // --------------------------
+        // APPLY entry seed when entering under a controlling terminator
+        // --------------------------
+        {
+            gimple* pred_term = controlling_terminator_of(bb);
+
+            // ==========================
+            // IF ENTRY (FIXED)
+            // ==========================
+            if (pred_term && gimple_code(pred_term) == GIMPLE_COND) {
+                int ifid = get_if_else_id_for_terminator(pred_term);
+                BranchCtx& ctx = ensure_ifctx(ifid, pred_term);
+                tree key = norm_obj_key(obj_address);
+
+                int st_before = 0;
+                if (auto itS = state_manager.object_states.find(obj_address);
+                    itS != state_manager.object_states.end()) st_before = itS->second;
+
+                int arm = arm_for_bb_under_cond(pred_term, bb);
+
+                printf("[ENTER IF] ifid=%d bb=%d arm=%d obj=%p key=%p state(before)=%d\n",
+                       ifid, bb ? bb->index : -1, arm,
+                       (void*)obj_address, (void*)key, st_before);
+
+                // If arm_sets missing (like your ifid=1 else-if), synthesize from last_guard + cond constant.
+                if (!ctx.arm_sets.count(key)) {
+                    printf("           arm_sets MISSING => trying SYNTH from last_guard\n");
+
+                    bool ok = synthesize_if_arm_sets_from_last_guard(ctx, key, pred_term);
+                    if (!ok) {
+                        printf("           [SYNTH] FAILED => cannot seed this IF\n");
+                    }
+                }
+
+                // If we have a guard pre-state (from PLAN or SYNTH), reset leaked state before seeding.
+                // This is the key to stop state 9 leaking into else-if.
+                if (ctx.guard_pre_state >= 0) {
+                    if (auto it = state_manager.object_states.find(obj_address);
+                        it != state_manager.object_states.end())
+                    {
+                        if (it->second != ctx.guard_pre_state) {
+                            printf("           [RESET] state leak detected: %d -> pre=%d\n",
+                                   it->second, ctx.guard_pre_state);
+                            it->second = ctx.guard_pre_state;
+                        }
+                    } else {
+                        state_manager.object_states[obj_address] = ctx.guard_pre_state;
+                        printf("           [RESET] state init to pre=%d\n", ctx.guard_pre_state);
+                    }
+                }
+
+                auto itSets = ctx.arm_sets.find(key);
+                if (itSets != ctx.arm_sets.end()) {
+                    printf("           arm_sets FOUND (t=%lu f=%lu)\n",
+                           (unsigned long)itSets->second.tset.count(),
+                           (unsigned long)itSets->second.fset.count());
+
+                    // Always push incoming state for this arm (after reset).
+                    int prev = 0;
+                    auto itPrev = state_manager.object_states.find(obj_address);
+                    if (itPrev != state_manager.object_states.end()) prev = itPrev->second;
+                    ctx.state_stack[key].push_back(prev);
+
+                    printf("           pushed prev=%d stack_sz=%zu\n",
+                           prev, (size_t)ctx.state_stack[key].size());
+
+                    Bitset possible; possible.reset();
+                    if (arm == 1) possible = itSets->second.tset;
+                    else if (arm == 0) possible = itSets->second.fset;
+
+                    ctx.active_set[key] = possible;
+                    if (arm == 0) g_else_chain_cands[key] = possible;
+
+                    printf("           seeded candidates=%lu\n",
+                           (unsigned long)possible.count());
+
+                    if (possible.count() == 1) {
+                        int s = first_set_bit(possible);
+                        if (s >= 0) {
+                            state_manager.object_states[obj_address] = s;
+                            printf("           new state=%d (singleton)\n", s);
+                        }
+                    } else {
+                        int now = 0;
+                        auto itNow = state_manager.object_states.find(obj_address);
+                        if (itNow != state_manager.object_states.end()) now = itNow->second;
+                        printf("           state now=%d (non-singleton)\n", now);
+                    }
+                } else {
+                    printf("           arm_sets still missing => NO push/seed\n");
+                }
+            }
+
+            // SWITCH entry 
+            if (pred_term && gimple_code(pred_term) == GIMPLE_SWITCH) {
+                handle_switch_entry(pred_term, bb, obj_address);
+            }
+        }
+
+        // current state after entry seeding
+        int current_state = 0;
+        if (auto itS = state_manager.object_states.find(obj_address);
+            itS != state_manager.object_states.end())
+            current_state = itS->second;
+        else
+            state_manager.object_states[obj_address] = current_state;
+
+        // --------------------------
+        // SWITCH PLAN 
+        // --------------------------
+        if (term && gimple_code(term) == GIMPLE_SWITCH) {
+            if (call_feeds_switch_index(stmt, term)) {
+
+                int ifid = get_if_else_id_for_terminator(term);
+                BranchCtx& ctx = ensure_ifctx(ifid, term);
+
+                // Guard origin: pre-state BEFORE applying the guard transition
+                ctx.guard_pre_state = current_state;
+                ctx.guard_method    = callee_name;
+
+                tree key = norm_obj_key(obj_address);
+
+                int arms = 0;
+                const gswitch* gs = as_a<const gswitch*>(term);
+                unsigned nlabels = gimple_switch_num_labels(gs);
+
+                for (unsigned i = 0; i < nlabels; ++i) {
+                    tree lab = gimple_switch_label(gs, i);
+                    if (!lab) continue;
+                    if (TREE_CODE(lab) != CASE_LABEL_EXPR) continue;
+                    if (CASE_LOW(lab)) arms++;
+                }
+                if (arms <= 0) arms = 1;
+
+                // Per-object countdown + init
+                ctx.sw_remaining[key]      = arms;
+                ctx.sw_remaining_init[key] = arms;
+
+                printf("[SW-PLAN] ifid=%d obj=%p pre=%d guard=%s arms=%d\n",
+                       ifid, (void*)obj_address, ctx.guard_pre_state,
+                       ctx.guard_method.c_str(), arms);
+
+                save_last_guard(obj_address, ctx.guard_pre_state, ctx.guard_method,
+                                &ctx.remaining, ctx.remaining_init);
+
+                return; // do not typecheck guard-producing call
+            }
+        }
+
+        // --------------------------
+        // IF PLAN 
+        // --------------------------
+        if (term && gimple_code(term) == GIMPLE_COND) {
+            bool feeds = call_feeds_terminator_cond(stmt, term);
+            printf("[IF-PLAN-CHECK] bb=%d callee=%s feeds=%d current_state=%d\n",
+                   bb ? bb->index : -1, callee_name.c_str(), (int)feeds, current_state);
+
+            if (feeds) {
+                int ifid = get_if_else_id_for_terminator(term);
+                BranchCtx& ctx = ensure_ifctx(ifid, term);
+
+                ctx.guard_pre_state = current_state;
+                ctx.guard_method = callee_name;
+
+                printf("[PLAN] IF guard detected: ifid=%d method=%s pre_state=%d bb=%d\n",
+                       ifid, callee_name.c_str(), current_state, bb ? bb->index : -1);
+
+                debug_print_condition(term, "PLAN", ifid);
+
+                record_pre_state(ifid, obj_address, current_state);
+
+                std::vector<int> candidates =
+                    transitions_for(current_state, callee_name, gimple_location(stmt));
+
+                Bitset outset;
+                for (int s : candidates) if (0 <= s && s < (int)outset.size()) outset.set(s);
+                record_arm_out_set(ifid, obj_address, outset);
+
+                tree key = norm_obj_key(obj_address);
+
+                if (!ctx.arm_choice.count(key)) {
+                    auto two = pick_two_arms(candidates);
+                    std::pair<int,int> choice = { two.first, two.second };
+
+                    tree res = gimple_call_lhs(stmt);
+                    CondOp op; int K;
+
+                    if (res && extract_eq_ne_with_const(term, res, op, K)) {
+                        int mapped = branch_next_for_cond(current_state, callee_name, K);
+                        printf("           extract const: K=%d op=%s mapped=%d\n",
+                               K, (op == OP_EQ ? "EQ" : "NE"), mapped);
+
+                        if (mapped >= 0) {
+                            ArmChoiceSet sets;
+                            sets.tset.reset();
+                            sets.fset.reset();
+
+                            auto fill_minus = [&](Bitset &out, int minus) {
+                                for (int s : candidates) {
+                                    if (s < 0 || s >= (int)out.size()) continue;
+                                    if (s == minus) continue;
+                                    out.set(s);
+                                }
+                            };
+
+                            if (op == OP_EQ) {
+                                if (0 <= mapped && mapped < (int)sets.tset.size()) sets.tset.set(mapped);
+                                fill_minus(sets.fset, mapped);
+                            } else {
+                                fill_minus(sets.tset, mapped);
+                                if (0 <= mapped && mapped < (int)sets.fset.size()) sets.fset.set(mapped);
+                            }
+
+                            ctx.arm_sets[key] = sets;
+                            g_else_chain_cands[key] = sets.fset;
+
+                            printf("           arm_sets created: tcnt=%lu fcnt=%lu\n",
+                                   (unsigned long)sets.tset.count(),
+                                   (unsigned long)sets.fset.count());
+                        } else {
+                            printf("           WARNING: branch_next_for_cond FAILED\n");
+                        }
+                    } else {
+                        printf("           WARNING: could not extract (res == const) from cond\n");
+                    }
+
+                    ctx.arm_choice[key] = choice;
+                } else {
+                    printf("           arm_choice already exists for key\n");
+                }
+
+                save_last_guard(obj_address, ctx.guard_pre_state, ctx.guard_method,
+                                &ctx.remaining, ctx.remaining_init);
+
+                return; // do not typecheck guard-producing call
+            }
+        }
+
+        // --------------------------
+        // Non-guarded path (prints state just before checking)
+        // --------------------------
+        {
             int branch_id = get_if_else_id_for_bb(bb);
             if (branch_id >= 0) {
+                gimple* ctl = controlling_terminator_of(bb);
+
+                if (ctl && (gimple_code(ctl) == GIMPLE_SWITCH || gimple_code(ctl) == GIMPLE_COND)) {
+                    int st = 0;
+                    auto itS = state_manager.object_states.find(obj_address);
+                    if (itS != state_manager.object_states.end()) st = itS->second;
+
+                    printf("[TYPECHECK] ctl=%d bb=%d method=%s obj=%p state=%d\n",
+                           (int)gimple_code(ctl),
+                           bb ? bb->index : -1,
+                           callee_name.c_str(),
+                           (void*)obj_address,
+                           st);
+
+                    state_manager.Typestate_Checking(obj_address, callee_name, gimple_location(stmt));
+                    return;
+                }
+
+                int st = 0;
+                auto itS = state_manager.object_states.find(obj_address);
+                if (itS != state_manager.object_states.end()) st = itS->second;
+
+                printf("[DEFER] branch_id=%d bb=%d method=%s obj=%p state=%d\n",
+                       branch_id, bb ? bb->index : -1,
+                       callee_name.c_str(), (void*)obj_address, st);
+
                 defer_branch_handling(branch_id, obj_address, callee_name, gimple_location(stmt), stmt);
                 return;
             }
 
-            // No branch context → straight-line check
+            int st = 0;
+            auto itS = state_manager.object_states.find(obj_address);
+            if (itS != state_manager.object_states.end()) st = itS->second;
+
+            printf("[TYPECHECK] (no-branch) bb=%d method=%s obj=%p state=%d\n",
+                   bb ? bb->index : -1,
+                   callee_name.c_str(),
+                   (void*)obj_address,
+                   st);
+
             state_manager.Typestate_Checking(obj_address, callee_name, gimple_location(stmt));
-               if (!is_recursive_transition_method(base_name)) {
-        return;  // not a recursive FSM edge → nothing to do
-    }
-
-   { std::fprintf(stderr,
-        "[pcd]  '%s' is a recursive transition method, checking depth\n",
-        base_name.c_str());
-
-    // Enforce: first argument = recursion depth (constant)
-    unsigned nargs = gimple_call_num_args(stmt);
-    if (nargs < 1) {
-        error_at(gimple_location(stmt),
-                 "Call to recursive transition '%s' must specify a recursion "
-                 "depth in its first parameter.",
-                 base_name.c_str());
-        return;
-    }
-
-    tree arg0 = gimple_call_arg(stmt, 1);
-    if (!arg0 || TREE_CODE(arg0) != INTEGER_CST) {
-        error_at(gimple_location(stmt),
-                 "Call to recursive transition '%s' must use a compile-time "
-                 "constant depth in its first argument (e.g., %s(2)).",
-                 base_name.c_str(), base_name.c_str());
-        return;
-    }
-
-    long depth = (long)TREE_INT_CST_LOW(arg0);
-    if (depth <= 0) {
-        error_at(gimple_location(stmt),
-                 "Recursion depth for '%s' must be positive (got %ld).",
-                 base_name.c_str(), depth);
-        return;
-    }
-
-    // Store it for WCET side
-    auto it = g_recursion_bound_by_method.find(base_name);
-    if (it != g_recursion_bound_by_method.end()) {
-        if (it->second != (int)depth) {
-            error_at(gimple_location(stmt),
-                     "Inconsistent recursion depth for '%s': previously %d, now %ld.",
-                     base_name.c_str(), it->second, depth);
-            return;
-        }
-    } else {
-        g_recursion_bound_by_method[base_name] = (int)depth;
-    }
-
-    std::fprintf(stderr,
-        "[pcd]  recursion depth for '%s' set to %ld\n",
-        base_name.c_str(), depth);
-        depth_r=depth;
-
- return;
-    }
-
-    
             return;
         }
     }
 
-    //  Arm-finalization hook
+    // --------------------------
+    // Arm-finalization hook (restore + switch join) + printf
+    // --------------------------
     {
-        tree this_arg = NULL_TREE;
+        tree this_arg2 = NULL_TREE;
         if (!DECL_STATIC_FUNCTION_P(callee_decl))
-            this_arg = gimple_call_arg(stmt, 0);
-        if (!this_arg) goto PARAMS;
+            this_arg2 = gimple_call_arg(stmt, 0);
+        if (!this_arg2) goto PARAMS;
 
-        this_arg = get_original_object(this_arg);
-        this_arg = track_all_aliases(this_arg);
-        if (!this_arg) goto PARAMS;
-        tree obj_address = NULL_TREE;
-        if (!is_object_of_Flagged(this_arg, obj_address)) goto PARAMS;
+        this_arg2 = get_original_object(this_arg2);
+        this_arg2 = track_all_aliases(this_arg2);
+        if (!this_arg2) goto PARAMS;
+
+        tree obj_address2 = NULL_TREE;
+        if (!is_object_of_Flagged(this_arg2, obj_address2)) goto PARAMS;
+
         basic_block bb_here = gimple_bb(stmt);
-        if (bb_here && is_inside_if_or_switch(bb_here) && is_end_of_arm_bb(bb_here)) {
-            tree key = norm_obj_key(obj_address);
-            if (key) {
-                end_branch_processing(key);
+
+        if (bb_here && is_inside_if_or_switch(bb_here)) {
+            gimple* pred_term = controlling_terminator_of(bb_here);
+            if (!pred_term) return;
+
+            bool end_arm = is_end_of_arm_bb(bb_here);
+
+            // SWITCH: also finalize at "break;" blocks (usually GIMPLE_GOTO)
+            if (!end_arm && gimple_code(pred_term) == GIMPLE_SWITCH) {
+                gimple_stmt_iterator it = gsi_last_bb(bb_here);
+                if (!gsi_end_p(it)) {
+                    gimple* last = gsi_stmt(it);
+                    if (last && (gimple_code(last) == GIMPLE_GOTO ||
+                                 gimple_code(last) == GIMPLE_RETURN)) {
+                        end_arm = true;
+                    }
+                }
+            }
+
+            if (end_arm) {
+                tree key = norm_obj_key(obj_address2);
+
+                int ifid = get_if_else_id_for_terminator(pred_term);
+                BranchCtx& ctx = ensure_ifctx(ifid, pred_term);
+
+                int arm_end_state = 0;
+                if (auto itS = state_manager.object_states.find(obj_address2);
+                    itS != state_manager.object_states.end())
+                    arm_end_state = itS->second;
+
+                printf("[ARM END] pred=%d ifid=%d bb=%d obj=%p state_before_restore=%d stack_sz=%zu\n",
+                       (int)gimple_code(pred_term),
+                       ifid,
+                       bb_here ? bb_here->index : -1,
+                       (void*)obj_address2,
+                       arm_end_state,
+                       (size_t)ctx.state_stack[key].size());
+
+                auto &stk = ctx.state_stack[key];
+                if (!stk.empty()) {
+                    printf("          restoring=%d\n", stk.back());
+                    int restored = stk.back();
+                    stk.pop_back();
+                    state_manager.object_states[obj_address2] = restored;
+                    printf("          restored state=%d stack_sz=%zu\n",
+                           restored, (size_t)stk.size());
+                } else {
+                    printf("          WARNING: stack empty (NO RESTORE)\n");
+                }
+
+                if (gimple_code(pred_term) == GIMPLE_SWITCH) {
+                    end_switch_case_processing(ctx, key, obj_address2,
+                                               arm_end_state, gimple_location(pred_term));
+                } else {
+                    end_branch_processing(key, bb_here);
+                }
+                return;
+            } else {
+                printf("[ARM] not end_arm bb=%d pred=%d\n",
+                       bb_here ? bb_here->index : -1,
+                       (int)gimple_code(pred_term));
             }
         }
         return;
     }
 
-
-        
-
 PARAMS:
-    //  Parameter → argument alias propagation (original)
+    // --------------------------
+    // Parameter → argument alias propagation (kept)
+    // --------------------------
     if (TREE_CODE(callee_decl) == FUNCTION_DECL) {
         tree param = DECL_ARGUMENTS(callee_decl);
         unsigned int arg_count = gimple_call_num_args(stmt);
@@ -4903,37 +6901,17 @@ PARAMS:
             tree arg = (i < arg_count) ? gimple_call_arg(stmt, i) : NULL_TREE;
             if (arg) { arg = get_original_object(arg); arg = track_all_aliases(arg); }
 
-            tree obj_address = NULL_TREE;
-            if (arg && is_object_of_Flagged(arg, obj_address)) {
-                state_manager.register_alias(param, obj_address);
+            tree obj_address3 = NULL_TREE;
+            if (arg && is_object_of_Flagged(arg, obj_address3)) {
+                state_manager.register_alias(param, obj_address3);
                 if (DECL_STRUCT_FUNCTION(callee_decl)) {
-                    process_function_body(callee_decl, obj_address);
+                    process_function_body(callee_decl, obj_address3);
                 }
             }
         }
     }
 }
 
-
-void check_recursive_wcet_for_function(tree fn_decl, double wcet_per_call_ms, double time_guard_ms) {
-    int bound = 0;
-    if (!get_recursion_bound(fn_decl, bound)) {
-        // Recursive but no bound recorded → reject
-        error_at(UNKNOWN_LOCATION,
-                 "Recursive function '%s' lacks a compile-time recursion bound.",
-                 IDENTIFIER_POINTER(DECL_NAME(fn_decl)));
-        fatal_error(UNKNOWN_LOCATION, "Unbounded recursion is not time-safe.");
-    }
-
-    double total_ms = bound * wcet_per_call_ms;
-    if (total_ms > time_guard_ms) {
-        error_at(UNKNOWN_LOCATION,
-                 "Recursion in '%s' exceeds time guard: %g ms (bound=%d, per-call=%g ms) > %g ms.",
-                 IDENTIFIER_POINTER(DECL_NAME(fn_decl)),
-                 total_ms, bound, wcet_per_call_ms, time_guard_ms);
-        fatal_error(UNKNOWN_LOCATION, "Recursive WCET violates time guard.");
-    }
-}
 
 
 /*******************************
@@ -5291,10 +7269,12 @@ register_callback(plugin_name, PLUGIN_START_UNIT,
         static bool once = false;
         if (!once) {
             try_merge_fsms_respecting_lsp_for_class_pair();
+              Analyse_all_functions();
              validate_wcet_vs_timed_rules();
-            Analyse_all_functions();
+          
+           validate_logic_with_timed_rules();
             print_timed_typestate_rules();
-         
+         //    print_typestate_rules();
         
             once = true;
         }
@@ -5315,6 +7295,7 @@ register_callback(plugin_name, PLUGIN_PRE_GENERICIZE, wcet_on_pre_genericize, nu
                       harvest_all_functions();
              //         print_annotated_wcet_list();
                  //   validate_wcet_vs_timed_rules();
+                
                       
                   }, nullptr);
     
