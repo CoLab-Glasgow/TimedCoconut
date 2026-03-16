@@ -35,7 +35,9 @@
 #include "dumpfile.h"
 #include <set>
 #include <sstream>
-
+#include <fstream>
+#include <iomanip>
+#include <memory>
 #include <cmath>      // for std::fabs
 #include <bitset>
 #include <optional>
@@ -184,26 +186,21 @@ static tree class_template_args(tree ty) {
 }
 
 
-// Per-edge timing info
 struct TimedInfo {
-    long long period_ns  = 0;   // period
-    long long offest_ns=0; // offest
-    long long U_deadline_ns= 0;   // upper duratio (relative)
-    long long L_deadline_ns= 0;   // lower duration (relative)
-    int criticality      = 0;   // enum integral value
-
+    long long period_ns     = 0;
+    long long offset_ns     = 0;
+    long long U_deadline_ns = 0;
+    long long L_deadline_ns = 0;
+    int criticality         = 0;
 };
 
-// from_state -> [(method, next_state, timing)]
 static std::map<int,
     std::vector<std::tuple<std::string,int,TimedInfo>>
 > Timed_Typestate_Rules;
 
-
-
-
 static bool as_sll(tree t, long long &out) {
-    if (!t || TREE_CODE(t) != INTEGER_CST) return false;
+    if (!t) return false;
+    if (TREE_CODE(t) != INTEGER_CST) return false;
     out = (long long)TREE_INT_CST_LOW(t);
     return true;
 }
@@ -215,45 +212,42 @@ static tree get_template_args_from_type(tree ty) {
     return nullptr;
 }
 
-// TimeGuard<Release, Period, Deadline, Criticality, Jitter?>
 static bool parse_timeguard(tree tg, TimedInfo &ti) {
     tree args = nullptr;
 
-    // TimeGuard is a template-id type; get its args
     if (TYPE_P(tg)) args = get_template_args_from_type(tg);
     if (!args || TREE_CODE(args) != TREE_VEC) return false;
 
     const int n = TREE_VEC_LENGTH(args);
-    if (n < 4) return false;
+    if (n < 5) return false;
 
-    long long  p=0, d=0, c=0, j=0 , ld=0;
-    tree a0 = TREE_VEC_ELT(args,0);
-    tree a1 = TREE_VEC_ELT(args,1);
-    tree a2 = TREE_VEC_ELT(args,2);
-    tree a3 = TREE_VEC_ELT(args,3);
-    tree a4 = TREE_VEC_ELT(args,4); 
-   // tree a4 = (n >= 5 ? TREE_VEC_ELT(args,4) : nullptr);
+    long long release = 0, period = 0, lower = 0, upper = 0, c = 0;
 
-    as_sll(a0, p);
-    as_sll(a2,ld);
-    as_sll(a3, d);
-   // as_sll(a2, c);
-    //if (a4) as_sll(a4, j);
+    tree a0 = TREE_VEC_ELT(args, 0); // release
+    tree a1 = TREE_VEC_ELT(args, 1); // period
+    tree a2 = TREE_VEC_ELT(args, 2); // lower
+    tree a3 = TREE_VEC_ELT(args, 3); // upper
+    tree a4 = TREE_VEC_ELT(args, 4); // criticality
 
-   
+    as_sll(a0, release);
+    as_sll(a1, period);
+    as_sll(a2, lower);
+    as_sll(a3, upper);
+
     if (TREE_CODE(a4) == INTEGER_CST) {
-        c = (int)TREE_INT_CST_LOW(a4 );
+        c = (int)TREE_INT_CST_LOW(a4);
     } else if (TREE_CODE(a4) == CONST_DECL) {
         tree v = DECL_INITIAL(a4);
-        if (v && TREE_CODE(v) == INTEGER_CST) c = (int)TREE_INT_CST_LOW(v);
+        if (v && TREE_CODE(v) == INTEGER_CST)
+            c = (int)TREE_INT_CST_LOW(v);
     }
 
-  
-    ti.period_ns   = p;
-    ti.U_deadline_ns = d;
-    ti.L_deadline_ns = ld;
-    ti.criticality = c;
-//    ti.jitter_ns   = j;
+    ti.offset_ns     = release;
+    ti.period_ns     = period;
+    ti.L_deadline_ns = lower;
+    ti.U_deadline_ns = upper;
+    ti.criticality   = (int)c;
+
     return true;
 }
 
@@ -313,16 +307,88 @@ static void process_timed_typestate_args(tree targs) {
     }
 }
 
+void AddBranchRulesToTimedRules()
+{
+    for (const auto& [state, branches] : Branch_Rules)
+    {
+        auto& timed_rules = Timed_Typestate_Rules[state];
+        if (branches.empty()) continue;
 
+        // All branch entries for this state should refer to the same source method.
+        const std::string& base_method = branches.front().method;
 
+        // Find timing info from the original base timed rule:
+        //     state --[base_method]--> some_default_target
+        TimedInfo base_tinfo{0, 0, 0, 1, 1};
+        bool found_base_rule = false;
 
+        for (const auto& rule : timed_rules)
+        {
+            if (std::get<0>(rule) == base_method)
+            {
+                base_tinfo = std::get<2>(rule);
+                found_base_rule = true;
+                break;
+            }
+        }
 
+        // Remove the original non-branch base rule and any previously-added cond rules
+        // for this same method, so the function is idempotent.
+        timed_rules.erase(
+            std::remove_if(
+                timed_rules.begin(),
+                timed_rules.end(),
+                [&](const auto& rule)
+                {
+                    const std::string& method = std::get<0>(rule);
 
+                    if (method == base_method) return true;
+
+                    const std::string prefix = base_method + "_cond_";
+                    if (method.rfind(prefix, 0) == 0) return true;
+
+                    return false;
+                }),
+            timed_rules.end());
+
+        // Add one rule per branch choice, reusing the original timing.
+        for (const auto& br : branches)
+        {
+            std::string event = br.method + "_cond_" + std::to_string(br.cond);
+
+            bool exists = false;
+            for (const auto& rule : timed_rules)
+            {
+                if (std::get<0>(rule) == event &&
+                    std::get<1>(rule) == br.next)
+                {
+                    exists = true;
+                    break;
+                }
+            }
+
+            if (!exists)
+            {
+                timed_rules.push_back(
+                    std::make_tuple(event, br.next, base_tinfo)
+                );
+            }
+        }
+
+        if (!found_base_rule)
+        {
+            std::fprintf(stderr,
+                "[branch-fix] warning: no base timed rule found for state=%d method='%s'; "
+                "used fallback timing\n",
+                state, base_method.c_str());
+        }
+    }
+}
 
 
 
 static void print_timed_typestate_rules() {
-
+AddBranchRulesToTimedRules();
     printf("Timed Typestate Rules\n");
     for (const auto &[from, edges] : Timed_Typestate_Rules) {
         printf("From state %d:\n", from);
@@ -334,7 +400,7 @@ static void print_timed_typestate_rules() {
 
             printf("  --[%s]--> %d\n", method.c_str(), to);
             printf("     Timing: Period=%lld, Offest=%lld, L_deadline=%lld, Upper_deadline=%lld, Criticality=%d\n",
-                   ti.period_ns, ti.offest_ns, ti.L_deadline_ns, ti.U_deadline_ns, ti.criticality);
+                   ti.period_ns, ti.offset_ns, ti.L_deadline_ns, ti.U_deadline_ns, ti.criticality);
         }
     }
 
@@ -1417,7 +1483,11 @@ static inline Contract contract_from_criticality(int crit) {
     }
 }
 
-static inline double ns_to_ms(long long ns) { return to_ms_ll(ns); }
+
+static double ns_to_ms(long long v)
+{
+      return static_cast<double>(v);
+}
 
 // If period present but no deadline, treat as SPORADIC: period = min inter-arrival,
 // not a per-transition budget.
@@ -1427,7 +1497,7 @@ static inline bool is_sporadic(const TimedInfo& ti) {
 
 // Worst-case release instant (release + jitter)
 static inline long long worst_release_ns(const TimedInfo& ti) {
-    long long j = ti.offest_ns;
+    long long j = ti.offset_ns;
     if (j < 0) j = 0;
     return  j;
 }
@@ -1463,12 +1533,12 @@ static bool check_edge_timing_ms(int state_id,
                                  double& t_abs /* in/out */)
 {
 
-    const double period_ms   = static_cast<double>(ti.period_ns);
+    const double period_ms   = ns_to_ms(ti.period_ns);
    
-    const double deadline_ms = static_cast<double>(ti.U_deadline_ns);
-    const double l_deadline_ms = static_cast<double>(ti.L_deadline_ns);
-    const double offset_ms   = static_cast<double>(ti.offest_ns); 
-    const int    crit        = static_cast<int>(ti.criticality);
+    const double deadline_ms =ns_to_ms(ti.U_deadline_ns);
+    const double l_deadline_ms = ns_to_ms(ti.L_deadline_ns);
+    const double offset_ms   = ns_to_ms(ti.offset_ns); 
+    const int    crit        = ns_to_ms(ti.criticality);
 
     const double tol = kTimelineAbsTolMs;
 
@@ -1540,7 +1610,7 @@ static void run_timeline_for_state_ms(
     if (all_ok && !edges.empty()) {
         const TimedInfo& last = std::get<2>(edges.back());
         const double period_ms = static_cast<double>(last.period_ns);
-       const double offset_ms   = static_cast<double>(last.offest_ns); 
+       const double offset_ms   = static_cast<double>(last.offset_ns); 
         if (period_ms > 0.0) {
             const double win_start = current_window_start(t_abs, period_ms, offset_ms);
             const double slack = (win_start + period_ms) - t_abs;
@@ -1564,6 +1634,7 @@ static inline bool same_ti(const TimedInfo& a, const TimedInfo& b) {
            a.criticality == b.criticality;
 }
 static void normalize_rules() {
+    AddBranchRulesToTimedRules();
     for (auto& kv : Timed_Typestate_Rules) {
         auto& v = kv.second;
         std::sort(v.begin(), v.end(),
@@ -1586,6 +1657,13 @@ static void normalize_rules() {
     }
 }
 
+struct TraceRow {
+    std::string method;
+    double start_ms;
+    double end_ms;
+    int from_state;
+    int to_state;
+};
 // Robust WCET lookup 
 static double wcet_lookup_ms_for_state_method(
     int from_state,
@@ -1614,78 +1692,773 @@ static double wcet_lookup_ms_for_state_method(
     return 0.0;
 }
 
-// End-to-end  trace that stops on repeat
-static void emit_end_to_end_asap_trace(
+#include <iomanip>
+static std::ofstream& trace_csv(const std::string& path, const std::string& header)
+{
+    static std::unordered_map<std::string, std::unique_ptr<std::ofstream>> files;
+
+    auto it = files.find(path);
+    if (it == files.end()) {
+        auto ofs = std::make_unique<std::ofstream>(path, std::ios::out | std::ios::trunc);
+        if (!ofs->is_open()) {
+            throw std::runtime_error(std::string("Failed to open CSV file: ") + path);
+        }
+
+        (*ofs) << header << "\n";
+        it = files.emplace(path, std::move(ofs)).first;
+    }
+
+    return *(it->second);
+}
+
+static void write_trace_row_csv(
+    const std::string& csv_path,
+    const std::string& method,
+    double start_ms,
+    double end_ms,
+    int from_state,
+    int to_state)
+{
+    auto& csv = trace_csv(csv_path, "method,start_ms,end_ms,duration_ms,from_state,to_state");
+
+    const double duration_ms = end_ms - start_ms;
+
+    csv << "\"" << method << "\","
+        << std::fixed << std::setprecision(2)
+        << start_ms << ","
+        << end_ms << ","
+        << duration_ms << ","
+        << from_state << ","
+        << to_state
+        << "\n";
+
+    csv.flush();
+}
+
+static void write_trace_summary_csv(
+    const std::string& csv_path,
+    const std::vector<TraceRow>& rows,
+    bool add_main_iter_row = true)
+{
+    auto& csv = trace_csv(csv_path, "FUNCTION,Iteration,Duration_ms");
+
+    std::unordered_map<std::string, int> iteration_by_function;
+
+    double total_ms = 0.0;
+    for (const auto& r : rows) {
+        const double duration_ms = r.end_ms - r.start_ms;
+        const int iteration = ++iteration_by_function[r.method];
+
+        csv << r.method << ","
+            << iteration << ","
+            << std::fixed << std::setprecision(2)
+            << duration_ms
+            << "\n";
+
+        total_ms += duration_ms;
+    }
+
+    if (add_main_iter_row) {
+        csv << "MAIN_ITER,1,"
+            << std::fixed << std::setprecision(2)
+            << total_ms
+            << "\n";
+    }
+
+    csv.flush();
+}
+
+#include <functional> 
+
+static void emit_end_to_end_ideal_asap_trace(
     const std::unordered_map<const void*, std::unordered_map<std::string,double>>& wcet_by_class)
 {
+    (void)wcet_by_class;
+
+    AddBranchRulesToTimedRules();
     if (Timed_Typestate_Rules.empty()) return;
 
-    // choose a start (prefer 0 if present)
-    int start_state = Timed_Typestate_Rules.begin()->first;
-    if (Timed_Typestate_Rules.count(0)) start_state = 0;
+    const int init_start_state = Timed_Typestate_Rules.count(0)
+                               ? 0
+                               : Timed_Typestate_Rules.begin()->first;
 
-    std::fprintf(stderr, "[trace] --- end-to-end time trace ---\n");
+    const int trace_start_state = init_start_state;
 
-    double t_ms = 0.0;
-    int cur = start_state;
-
-    // Stop criteria
-    std::set<std::pair<int,std::string>> seen_edges; // (from_state, method)
-    std::set<int> seen_states;                       // optional: track states too
-    const int hard_cap = (int)Timed_Typestate_Rules.size() * 10;
-  std::fprintf(stderr,
-    "[trace] states=%zu, hard_cap=%d\n",
-    Timed_Typestate_Rules.size(), hard_cap);
-
-    for (int step = 0; step < hard_cap; ++step) {
-        auto it = Timed_Typestate_Rules.find(cur);
-        if (it == Timed_Typestate_Rules.end() || it->second.empty()) break;
-
-        // deterministic: first outgoing edge after normalization
-        const auto& edge   = it->second.front();
-        const std::string& method   = std::get<0>(edge);
-        const int          to_state = std::get<1>(edge);
-        const TimedInfo&   ti       = std::get<2>(edge);
-
-        // stop if we loop back to start after first hop
-        if (step > 0 && cur == start_state) {
-            std::fprintf(stderr, "[trace] stop: returned to start_state=%d\n", start_state);
-            break;
+    int max_state_id = init_start_state;
+    for (const auto& kv : Timed_Typestate_Rules) {
+        if (kv.first > max_state_id) max_state_id = kv.first;
+        for (const auto& edge : kv.second) {
+            max_state_id = std::max(max_state_id, std::get<1>(edge));
         }
-        // stop if this (state,method) already seen
-        auto key = std::make_pair(cur, method);
-        if (seen_edges.count(key)) {
-            std::fprintf(stderr, "[trace] stop: cycle detected at state %d via '%s'\n",
-                         cur, method.c_str());
-            break;
+    }
+
+    const int completion_state = max_state_id;
+
+    const int MAX_VISITS_PER_STATE = 2;
+    const double cycle_budget_ms =
+        (g_cycle_n > 0) ? ns_to_ms(g_cycle_n)
+                        : std::numeric_limits<double>::infinity();
+
+    const int hard_cap =
+        static_cast<int>(Timed_Typestate_Rules.size()) * (MAX_VISITS_PER_STATE + 4);
+
+    struct TraceRow {
+        std::string method;
+        double start_ms;
+        double end_ms;
+        int from_state;
+        int to_state;
+    };
+
+    auto edge_time_ms = [](const TimedInfo& ti) -> double {
+        if (ti.U_deadline_ns > 0) return ns_to_ms(ti.U_deadline_ns);
+        if (ti.period_ns > 0)     return ns_to_ms(ti.period_ns);
+        return 0.0;
+    };
+
+    auto is_guard_or_cond = [](const std::string& method) -> bool {
+        return method.find("_cond_")  != std::string::npos ||
+               method.find("_guard_") != std::string::npos;
+    };
+
+    auto is_completion_edge = [&](const std::string& method, int from_state, int to_state) -> bool {
+        (void)from_state;
+        if (method == "End") return true;
+        if (to_state == completion_state) return true;
+        return false;
+    };
+
+    auto create_trace_csv = [](const std::string& filename) -> bool {
+        FILE* fp = std::fopen(filename.c_str(), "w");
+        if (!fp) {
+            std::perror(("[trace] fopen failed for " + filename).c_str());
+            return false;
         }
-        seen_edges.insert(key);
-        seen_states.insert(cur);
+        std::fprintf(fp, "method,start_ms,end_ms,duration_ms,from_state,to_state\n");
+        std::fclose(fp);
+        return true;
+    };
 
-        const double wcet_ms = wcet_lookup_ms_for_state_method(cur, method, wcet_by_class);
-        const double t_next  = t_ms + wcet_ms;
+    auto append_trace_row_csv = [](const std::string& filename,
+                                   const TraceRow& r) -> bool {
+        FILE* fp = std::fopen(filename.c_str(), "a");
+        if (!fp) {
+            std::perror(("[trace] fopen failed for " + filename).c_str());
+            return false;
+        }
+        std::fprintf(fp, "\"%s\",%.2f,%.2f,%.2f,%d,%d\n",
+                     r.method.c_str(),
+                     r.start_ms,
+                     r.end_ms,
+                     r.end_ms - r.start_ms,
+                     r.from_state,
+                     r.to_state);
+        std::fclose(fp);
+        return true;
+    };
 
+auto save_trace_csv = [&](const std::string& filename,
+                          const std::vector<TraceRow>& rows) -> bool {
+    try {
+        // detailed CSV
+        {
+            std::ofstream detailed(filename, std::ios::out | std::ios::trunc);
+            if (!detailed.is_open()) {
+                throw std::runtime_error("Failed to open detailed trace file: " + filename);
+            }
+
+            detailed << "method,start_ms,end_ms,duration_ms,from_state,to_state\n";
+            for (const auto& r : rows) {
+                detailed << "\"" << r.method << "\","
+                         << std::fixed << std::setprecision(2)
+                         << r.start_ms << ","
+                         << r.end_ms << ","
+                         << (r.end_ms - r.start_ms) << ","
+                         << r.from_state << ","
+                         << r.to_state
+                         << "\n";
+            }
+        }
+
+        // summary CSV like your screenshot
+        const std::string summary_filename =
+            filename.substr(0, filename.find_last_of('.')) + "_summary.csv";
+
+        {
+            std::ofstream summary(summary_filename, std::ios::out | std::ios::trunc);
+            if (!summary.is_open()) {
+                throw std::runtime_error("Failed to open summary trace file: " + summary_filename);
+            }
+
+            summary << "FUNCTION,Iteration,Duration_ms\n";
+
+            std::unordered_map<std::string, int> iteration_by_function;
+            double total_ms = 0.0;
+
+            for (const auto& r : rows) {
+                const double duration_ms = r.end_ms - r.start_ms;
+                const int iteration = ++iteration_by_function[r.method];
+
+                summary << r.method << ","
+                        << iteration << ","
+                        << std::fixed << std::setprecision(2)
+                        << duration_ms
+                        << "\n";
+
+                total_ms += duration_ms;
+            }
+
+            summary << "MAIN_ITER,1,"
+                    << std::fixed << std::setprecision(2)
+                    << total_ms
+                    << "\n";
+        }
+
+        return true;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[trace][ERROR] %s\n", e.what());
+        return false;
+    }
+};
+
+    auto print_trace = [](const char* label,
+                          const std::vector<TraceRow>& rows,
+                          double path_total_ms,
+                          double cycle_budget_ms) {
         std::fprintf(stderr,
-    "[trace] t_%d=%.2f ms --%s()--> t_%d=%.2f ms\n",
-    step, t_ms, method.c_str(), step + 1, t_next);
-
-
-        if (ti.U_deadline_ns > 0) {
-            std::fprintf(stderr, " (d<%.4f ms)", ns_to_ms(ti.U_deadline_ns));
-        } else if (ti.period_ns > 0) {
-            std::fprintf(stderr, " (p%s%.4f ms)", is_sporadic(ti) ? ">=" : "=", ns_to_ms(ti.period_ns));
+                     "[trace] --- %s completed IDEAL path (path=%.2f ms, cycle=%.2f ms, rows=%zu) ---\n",
+                     label, path_total_ms, cycle_budget_ms, rows.size());
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const auto& r = rows[i];
+            std::fprintf(stderr,
+                         "[trace] t_%zu=%.2f ms --%s()--> t_%zu=%.2f ms [state %d -> %d]\n",
+                         i,
+                         r.start_ms,
+                         r.method.c_str(),
+                         i + 1,
+                         r.end_ms,
+                         r.from_state,
+                         r.to_state);
         }
-        std::fprintf(stderr, " [state %d -> %d]\n", cur, to_state);
+    };
 
-        t_ms = t_next;
-        cur = to_state;
+   auto with_cycle_rows = [&](const std::vector<TraceRow>& base_rows,
+                           double full_total_ms) -> std::vector<TraceRow>
+{
+    std::vector<TraceRow> out = base_rows;
+
+    if (!std::isfinite(cycle_budget_ms) || cycle_budget_ms <= 0.0) {
+        return out;
+    }
+
+    if (full_total_ms < cycle_budget_ms) {
+        out.push_back({
+            "IdleUntilCycleEnd",
+            full_total_ms,
+            cycle_budget_ms,
+            completion_state,
+            trace_start_state
+        });
+    } else if (full_total_ms > cycle_budget_ms) {
+        out.push_back({
+            "CycleOverrun",
+            cycle_budget_ms,
+            full_total_ms,
+            completion_state,
+            trace_start_state
+        });
+    }
+
+    return out;
+};
+
+    std::string trace_class_name = "UnknownClass";
+    if (!TypestateClassConnector_args.empty() && !TypestateClassConnector_args[0].empty()) {
+        trace_class_name = TypestateClassConnector_args[0];
+        for (char& c : trace_class_name) {
+            if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-')) {
+                c = '_';
+            }
+        }
+        if (trace_class_name.empty()) trace_class_name = "UnknownClass";
+    }
+
+    int trace_id = 0;
+    int violating_trace_count = 0;
+
+    std::vector<TraceRow> shortest_rows;
+    std::vector<TraceRow> longest_rows;
+    std::vector<TraceRow> longest_step_rows;
+
+    double shortest_total_ms = std::numeric_limits<double>::infinity();
+    double longest_total_ms  = -1.0;
+    double longest_step_total_ms = -1.0;
+    size_t longest_step_count = 0;
+
+    std::function<void(
+        int,
+        double,
+        int,
+        std::vector<TraceRow>&,
+        std::unordered_map<int,int>&
+    )> dfs;
+
+    dfs = [&](int cur,
+              double t_ms,
+              int depth,
+              std::vector<TraceRow>& rows,
+              std::unordered_map<int,int>& state_visits)
+    {
+        if (depth >= hard_cap) return;
+
+        auto it = Timed_Typestate_Rules.find(cur);
+        if (it == Timed_Typestate_Rules.end() || it->second.empty()) return;
+
+        for (const auto& edge : it->second) {
+            const std::string& method = std::get<0>(edge);
+            const int to_state        = std::get<1>(edge);
+            const TimedInfo& ti       = std::get<2>(edge);
+
+            if (to_state != completion_state &&
+                state_visits[to_state] >= MAX_VISITS_PER_STATE) {
+                continue;
+            }
+
+            const double dt_ms    = edge_time_ms(ti);
+            const double start_ms = t_ms;
+            const double end_ms   = start_ms + dt_ms;
+
+            const bool keep_row = !is_guard_or_cond(method);
+            if (keep_row) {
+                rows.push_back({method, start_ms, end_ms, cur, to_state});
+            }
+
+            if (is_completion_edge(method, cur, to_state)) {
+                const double full_total_ms =
+                    rows.empty() ? 0.0 : rows.back().end_ms;
+                const size_t full_step_count = rows.size();
+
+                const auto rows_with_cycle = with_cycle_rows(rows, full_total_ms);
+
+                const std::string csv_name =
+                    "TCIDEAL_" + trace_class_name + "_trace_" + std::to_string(trace_id) + ".csv";
+
+                save_trace_csv(csv_name, rows_with_cycle);
+
+                if (full_total_ms < shortest_total_ms) {
+                    shortest_total_ms = full_total_ms;
+                    shortest_rows = rows_with_cycle;
+                }
+
+                if (full_total_ms > longest_total_ms) {
+                    longest_total_ms = full_total_ms;
+                    longest_rows = rows_with_cycle;
+                }
+
+                if (full_step_count > longest_step_count ||
+                    (full_step_count == longest_step_count &&
+                     full_total_ms > longest_step_total_ms)) {
+                    longest_step_count = full_step_count;
+                    longest_step_total_ms = full_total_ms;
+                    longest_step_rows = rows_with_cycle;
+                }
+
+                if (std::isfinite(cycle_budget_ms) && full_total_ms > cycle_budget_ms) {
+                    ++violating_trace_count;
+                    std::fprintf(stderr,
+                                 "[trace][ERROR] IDEAL trace #%d = %.2f ms exceeds cycle budget %.2f ms by %.2f ms\n",
+                                 trace_id,
+                                 full_total_ms,
+                                 cycle_budget_ms,
+                                 full_total_ms - cycle_budget_ms);
+                }
+
+                ++trace_id;
+            } else {
+                state_visits[to_state]++;
+                dfs(to_state, end_ms, depth + 1, rows, state_visits);
+                state_visits[to_state]--;
+            }
+
+            if (keep_row) {
+                rows.pop_back();
+            }
+        }
+    };
+
+    std::vector<TraceRow> rows;
+    std::unordered_map<int,int> state_visits;
+    state_visits[trace_start_state] = 1;
+
+    dfs(trace_start_state, 0.0, 0, rows, state_visits);
+
+    std::fprintf(stderr,
+                 "[trace] completed IDEAL traces saved for class %s: %d\n",
+                 trace_class_name.c_str(),
+                 trace_id);
+
+    if (!shortest_rows.empty()) {
+        print_trace("shortest", shortest_rows, shortest_total_ms, cycle_budget_ms);
+        save_trace_csv("TCIDEAL_" + trace_class_name + "_trace_shortest.csv",
+                       shortest_rows);
+    }
+
+    if (!longest_rows.empty()) {
+        print_trace("longest", longest_rows, longest_total_ms, cycle_budget_ms);
+        save_trace_csv("TCIDEAL_" + trace_class_name + "_trace_longest.csv",
+                       longest_rows);
+    }
+
+    if (!longest_step_rows.empty()) {
+        print_trace("longest-by-steps", longest_step_rows, longest_step_total_ms, cycle_budget_ms);
+        save_trace_csv("TCIDEAL_" + trace_class_name + "_trace_longest_steps.csv",
+                       longest_step_rows);
+    }
+
+    if (violating_trace_count > 0) {
+        std::fprintf(stderr,
+                     "[trace][ERROR] %d completed IDEAL trace(s) exceed the cycle budget %.2f ms\n",
+                     violating_trace_count,
+                     cycle_budget_ms);
+    } else if (trace_id > 0 && std::isfinite(cycle_budget_ms)) {
+        std::fprintf(stderr,
+                     "[trace][OK] all completed IDEAL trace(s) are within cycle budget %.2f ms\n",
+                     cycle_budget_ms);
     }
 }
 
+// End-to-end trace that stops on repeat
+#include <limits>
+#include <cmath>
 
+static void emit_end_to_end_asap_trace(
+    const std::unordered_map<const void*, std::unordered_map<std::string,double>>& wcet_by_class)
+{
+    AddBranchRulesToTimedRules();
+    if (Timed_Typestate_Rules.empty()) return;
 
+    const int init_start_state = Timed_Typestate_Rules.count(0)
+                               ? 0
+                               : Timed_Typestate_Rules.begin()->first;
 
+    const int trace_start_state = init_start_state;
 
+    int max_state_id = init_start_state;
+    for (const auto& kv : Timed_Typestate_Rules) {
+        if (kv.first > max_state_id) max_state_id = kv.first;
+        for (const auto& edge : kv.second) {
+            max_state_id = std::max(max_state_id, std::get<1>(edge));
+        }
+    }
+
+    const int completion_state = max_state_id;
+
+    const int MAX_VISITS_PER_STATE = 2;
+    const double cycle_budget_ms =
+        (g_cycle_n > 0) ? ns_to_ms(g_cycle_n)
+                        : std::numeric_limits<double>::infinity();
+
+    const int hard_cap =
+        static_cast<int>(Timed_Typestate_Rules.size()) * (MAX_VISITS_PER_STATE + 4);
+
+    struct TraceRow {
+        std::string method;
+        double start_ms;
+        double end_ms;
+        int from_state;
+        int to_state;
+    };
+
+    auto is_guard_or_cond = [](const std::string& method) -> bool {
+        return method.find("_cond_")  != std::string::npos ||
+               method.find("_guard_") != std::string::npos;
+    };
+
+    auto is_completion_edge = [&](const std::string& method, int from_state, int to_state) -> bool {
+        (void)from_state;
+        if (method == "End") return true;
+        if (to_state == completion_state) return true;
+        return false;
+    };
+
+    auto create_trace_csv = [](const std::string& filename) -> bool {
+        FILE* fp = std::fopen(filename.c_str(), "w");
+        if (!fp) {
+            std::perror(("[trace] fopen failed for " + filename).c_str());
+            return false;
+        }
+        std::fprintf(fp, "method,start_ms,end_ms,duration_ms,from_state,to_state\n");
+        std::fclose(fp);
+        return true;
+    };
+
+    auto append_trace_row_csv = [](const std::string& filename,
+                                   const TraceRow& r) -> bool {
+        FILE* fp = std::fopen(filename.c_str(), "a");
+        if (!fp) {
+            std::perror(("[trace] fopen failed for " + filename).c_str());
+            return false;
+        }
+        std::fprintf(fp, "\"%s\",%.2f,%.2f,%.2f,%d,%d\n",
+                     r.method.c_str(),
+                     r.start_ms,
+                     r.end_ms,
+                     r.end_ms - r.start_ms,
+                     r.from_state,
+                     r.to_state);
+        std::fclose(fp);
+        return true;
+    };
+
+   auto save_trace_csv = [&](const std::string& filename,
+                          const std::vector<TraceRow>& rows) -> bool {
+    try {
+        // detailed CSV
+        {
+            std::ofstream detailed(filename, std::ios::out | std::ios::trunc);
+            if (!detailed.is_open()) {
+                throw std::runtime_error("Failed to open detailed trace file: " + filename);
+            }
+
+            detailed << "method,start_ms,end_ms,duration_ms,from_state,to_state\n";
+            for (const auto& r : rows) {
+                detailed << "\"" << r.method << "\","
+                         << std::fixed << std::setprecision(2)
+                         << r.start_ms << ","
+                         << r.end_ms << ","
+                         << (r.end_ms - r.start_ms) << ","
+                         << r.from_state << ","
+                         << r.to_state
+                         << "\n";
+            }
+        }
+
+        // summary CSV like your screenshot
+        const std::string summary_filename =
+            filename.substr(0, filename.find_last_of('.')) + "_summary.csv";
+
+        {
+            std::ofstream summary(summary_filename, std::ios::out | std::ios::trunc);
+            if (!summary.is_open()) {
+                throw std::runtime_error("Failed to open summary trace file: " + summary_filename);
+            }
+
+            summary << "FUNCTION,Iteration,Duration_ms\n";
+
+            std::unordered_map<std::string, int> iteration_by_function;
+            double total_ms = 0.0;
+
+            for (const auto& r : rows) {
+                const double duration_ms = r.end_ms - r.start_ms;
+                const int iteration = ++iteration_by_function[r.method];
+
+                summary << r.method << ","
+                        << iteration << ","
+                        << std::fixed << std::setprecision(2)
+                        << duration_ms
+                        << "\n";
+
+                total_ms += duration_ms;
+            }
+
+            summary << "MAIN_ITER,1,"
+                    << std::fixed << std::setprecision(2)
+                    << total_ms
+                    << "\n";
+        }
+
+        return true;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[trace][ERROR] %s\n", e.what());
+        return false;
+    }
+};
+    auto print_trace = [](const char* label,
+                          const std::vector<TraceRow>& rows,
+                          double path_total_ms,
+                          double cycle_budget_ms) {
+        std::fprintf(stderr,
+                     "[trace] --- %s completed WCET path (path=%.2f ms, cycle=%.2f ms, rows=%zu) ---\n",
+                     label, path_total_ms, cycle_budget_ms, rows.size());
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const auto& r = rows[i];
+            std::fprintf(stderr,
+                         "[trace] t_%zu=%.2f ms --%s()--> t_%zu=%.2f ms [state %d -> %d]\n",
+                         i,
+                         r.start_ms,
+                         r.method.c_str(),
+                         i + 1,
+                         r.end_ms,
+                         r.from_state,
+                         r.to_state);
+        }
+    };
+
+  auto with_cycle_rows = [&](const std::vector<TraceRow>& base_rows,
+                           double full_total_ms) -> std::vector<TraceRow>
+{
+    std::vector<TraceRow> out = base_rows;
+
+    if (!std::isfinite(cycle_budget_ms) || cycle_budget_ms <= 0.0) {
+        return out;
+    }
+
+    if (full_total_ms < cycle_budget_ms) {
+        out.push_back({
+            "IdleUntilCycleEnd",
+            full_total_ms,
+            cycle_budget_ms,
+            completion_state,
+            trace_start_state
+        });
+    } else if (full_total_ms > cycle_budget_ms) {
+        out.push_back({
+            "CycleOverrun",
+            cycle_budget_ms,
+            full_total_ms,
+            completion_state,
+            trace_start_state
+        });
+    }
+
+    return out;
+};
+
+    std::string trace_class_name = "UnknownClass";
+    if (!TypestateClassConnector_args.empty() && !TypestateClassConnector_args[0].empty()) {
+        trace_class_name = TypestateClassConnector_args[0];
+        for (char& c : trace_class_name) {
+            if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-')) {
+                c = '_';
+            }
+        }
+        if (trace_class_name.empty()) trace_class_name = "UnknownClass";
+    }
+
+    int trace_id = 0;
+    int violating_trace_count = 0;
+
+    std::vector<TraceRow> shortest_rows;
+    std::vector<TraceRow> longest_rows;
+
+    double shortest_total_ms = std::numeric_limits<double>::infinity();
+    double longest_total_ms  = -1.0;
+
+    std::function<void(
+        int,
+        double,
+        int,
+        std::vector<TraceRow>&,
+        std::unordered_map<int,int>&
+    )> dfs;
+
+    dfs = [&](int cur,
+              double t_ms,
+              int depth,
+              std::vector<TraceRow>& rows,
+              std::unordered_map<int,int>& state_visits)
+    {
+        if (depth >= hard_cap) return;
+
+        auto it = Timed_Typestate_Rules.find(cur);
+        if (it == Timed_Typestate_Rules.end() || it->second.empty()) return;
+
+        for (const auto& edge : it->second) {
+            const std::string& method = std::get<0>(edge);
+            const int to_state        = std::get<1>(edge);
+
+            if (to_state != completion_state &&
+                state_visits[to_state] >= MAX_VISITS_PER_STATE) {
+                continue;
+            }
+
+            const double wcet_ms  = wcet_lookup_ms_for_state_method(cur, method, wcet_by_class);
+            const double start_ms = t_ms;
+            const double end_ms   = start_ms + wcet_ms;
+
+            const bool keep_row = !is_guard_or_cond(method);
+            if (keep_row) {
+                rows.push_back({method, start_ms, end_ms, cur, to_state});
+            }
+
+            if (is_completion_edge(method, cur, to_state)) {
+                const double full_total_ms =
+                    rows.empty() ? 0.0 : rows.back().end_ms;
+
+                const auto rows_with_cycle = with_cycle_rows(rows, full_total_ms);
+
+                const std::string csv_name =
+                    "TCWCET_" + trace_class_name + "_trace_" + std::to_string(trace_id) + ".csv";
+
+                save_trace_csv(csv_name, rows_with_cycle);
+
+                if (full_total_ms < shortest_total_ms) {
+                    shortest_total_ms = full_total_ms;
+                    shortest_rows = rows_with_cycle;
+                }
+
+                if (full_total_ms > longest_total_ms) {
+                    longest_total_ms = full_total_ms;
+                    longest_rows = rows_with_cycle;
+                }
+
+                if (std::isfinite(cycle_budget_ms) && full_total_ms > cycle_budget_ms) {
+                    ++violating_trace_count;
+                    std::fprintf(stderr,
+                                 "[trace][ERROR] WCET trace #%d = %.2f ms exceeds cycle budget %.2f ms by %.2f ms\n",
+                                 trace_id,
+                                 full_total_ms,
+                                 cycle_budget_ms,
+                                 full_total_ms - cycle_budget_ms);
+                }
+
+                ++trace_id;
+            } else {
+                state_visits[to_state]++;
+                dfs(to_state, end_ms, depth + 1, rows, state_visits);
+                state_visits[to_state]--;
+            }
+
+            if (keep_row) {
+                rows.pop_back();
+            }
+        }
+    };
+
+    std::vector<TraceRow> rows;
+    std::unordered_map<int,int> state_visits;
+    state_visits[trace_start_state] = 1;
+
+    dfs(trace_start_state, 0.0, 0, rows, state_visits);
+
+    std::fprintf(stderr,
+                 "[trace] completed WCET traces saved for class %s: %d\n",
+                 trace_class_name.c_str(),
+                 trace_id);
+
+    if (!shortest_rows.empty()) {
+        print_trace("shortest", shortest_rows, shortest_total_ms, cycle_budget_ms);
+        save_trace_csv("TCWCET_" + trace_class_name + "_trace_shortest.csv",
+                       shortest_rows);
+    }
+
+    if (!longest_rows.empty()) {
+        print_trace("longest", longest_rows, longest_total_ms, cycle_budget_ms);
+        save_trace_csv("TCWCET_" + trace_class_name + "_trace_longest.csv",
+                       longest_rows);
+    }
+
+    if (violating_trace_count > 0) {
+        std::fprintf(stderr,
+                     "[trace][ERROR] %d completed WCET trace(s) exceed the cycle budget %.2f ms\n",
+                     violating_trace_count,
+                     cycle_budget_ms);
+    } else if (trace_id > 0 && std::isfinite(cycle_budget_ms)) {
+        std::fprintf(stderr,
+                     "[trace][OK] all completed WCET trace(s) are within cycle budget %.2f ms\n",
+                     cycle_budget_ms);
+    }
+}
 
 /** functions below used for sep logic checking  */
 
@@ -2260,6 +3033,7 @@ static void validate_logic_with_timed_rules() {
 static void validate_wcet_vs_timed_rules() {
     // 1) WCET source (prefer class-aware; else fallback)
     normalize_rules();
+   
     std::unordered_map<const void*, std::unordered_map<std::string,double>> wcet_by_class = g_annot_wcet_ms;
     bool used_fallback = false;
     if (wcet_by_class.empty()) {
@@ -2357,7 +3131,7 @@ static void validate_wcet_vs_timed_rules() {
                 if (bucket_it != wcet_by_class.end()) {
                     const auto& bucket = bucket_it->second;
                     if (auto fn_it = bucket.find(method); fn_it != bucket.end()) {
-                        const double wcet_ms = fn_it->second;
+                         double wcet_ms = fn_it->second;
                         all_edges.push_back({from_state, to_state, method, wcet_ms, ti, is_recursive});
                     } else {
                         // report_violation(false,
@@ -2407,12 +3181,19 @@ static void validate_wcet_vs_timed_rules() {
                 continue;
             }
 
-            const double wcet_ms = fn_it->second;
+             double wcet_ms = fn_it->second;
+              bool uppersamelower = (lower_rule_ms == rule_ms );
+            if (uppersamelower) {
+          //      std::fprintf(stderr, "  [upper-same-lower] %s\n", method.c_str());
+                wcet_ms = std::floor(wcet_ms ); // round up to nearest tol to avoid false violation due to minor noise
+            }
             const double tol = std::max(kAbsTolMs, std::fabs(rule_ms) * kRelTol);
 
             bool hard_violate = false;
             bool soft_warn    = false;
             bool soft_over    = false;
+
+            
 
             if (ctr == Contract::HARD) {
                 // HARD/FIRM: WCET must not exceed the budget (within tolerance) witin lower and upper 
@@ -2438,6 +3219,7 @@ static void validate_wcet_vs_timed_rules() {
 
             // Record for global path (raw wcet_ms; recursion handled later via effective WCET)
             all_edges.push_back({from_state, to_state, method, wcet_ms, ti, is_recursive});
+           
 
             // Emit diagnostics
             if (ctr == Contract::HARD && hard_violate) {
@@ -2580,7 +3362,7 @@ static void validate_wcet_vs_timed_rules() {
                  "End-to-end cycle time %.6f ms exceeds bound %.6f ms.",
                  cycle_ms, g_cycle_n);
     }
-
+    emit_end_to_end_ideal_asap_trace(wcet_by_class);
     emit_end_to_end_asap_trace(wcet_by_class);
 }
 
@@ -2794,7 +3576,7 @@ static void Typestate_Visualisation(const std::string& filename,
             lbl << method
                // << "\\nR=" << fmt(ti.release_ns)
                 << " P="  << fmt(ti.period_ns)
-                << " offest="  << fmt(ti.offest_ns)
+                << " offest="  << fmt(ti.offset_ns)
                 << " Upper=" << fmt(ti.U_deadline_ns)
                 << " Lower="  << fmt(ti.L_deadline_ns)
                 << " C="  << fmt(ti.criticality);
@@ -6000,61 +6782,69 @@ static tree switch_index_from_stmt(gimple* sw) {
     return gimple_switch_index(gs);
 }
 
+#include "tree-cfg.h"
+
+static inline basic_block coconut_label_to_block(tree tgt)
+{
+#if BUILDING_GCC_VERSION >= 9000
+    // newer GCC API
+    return label_to_block(cfun, tgt);
+#else
+    // older GCC API, including GCC 7.x AVR plugin headers
+    return label_to_block(tgt);
+#endif
+}
 // Returns true if bb is one of the switch destinations.
-// If it’s default, is_default_out=true (case_value_out ignored).
 static bool switch_case_value_for_bb(gimple* sw,
                                      basic_block bb,
                                      int &case_value_out,
                                      bool &is_default_out)
 {
-    const gswitch* gs = as_a<const gswitch*>(sw);
+    gswitch* gs = as_a<gswitch*>(sw);
     unsigned n = gimple_switch_num_labels(gs);
 
     for (unsigned i = 0; i < n; ++i) {
         tree lab = gimple_switch_label(gs, i);
         if (!lab) continue;
 
-        // In GCC, switch labels are usually CASE_LABEL_EXPR.
-        // label_to_block wants the LABEL_DECL (CASE_LABEL(lab)).
         tree tgt = lab;
         if (TREE_CODE(lab) == CASE_LABEL_EXPR && CASE_LABEL(lab))
             tgt = CASE_LABEL(lab);
-
+    #if BUILDING_GCC_VERSION >= 9000
         basic_block dest = label_to_block(cfun, tgt);
+        #else
+    // older GCC API, including GCC 7.x AVR plugin headers
+   basic_block dest = label_to_block(tgt);
+#endif
 
-        // Fallback: some forms might already be a label-like node
         if (dest != bb) {
-             basic_block dest2 = label_to_block(cfun, lab);
-            fprintf(stderr,
-         //   "Debug: SWITCH match? cur_bb=%d lab_code=%s tgt_code=%s dest=%d alt_dest=%d\n",
-         //   bb->index,
-            get_tree_code_name(TREE_CODE(lab)),
-            get_tree_code_name(TREE_CODE(tgt)),
-            dest ? dest->index : -1,
-            dest2 ? dest2->index : -1);
-          
-            if (dest2 != bb) continue;
+             #if BUILDING_GCC_VERSION >= 9000
+        basic_block dest2 = label_to_block(cfun, tgt);
+        #else
+    // older GCC API, including GCC 7.x AVR plugin headers
+   basic_block dest2 = label_to_block(tgt);
+#endif
+            if (dest2 != bb)
+                continue;
         }
 
-        tree low = CASE_LOW(lab);   // default has no CASE_LOW
+        tree low = CASE_LOW(lab);
         if (!low) {
             is_default_out = true;
             return true;
         }
 
         if (TREE_CODE(low) == INTEGER_CST) {
-            case_value_out = (int)tree_to_shwi(low);
+            case_value_out = (int) tree_to_shwi(low);
             is_default_out = false;
             return true;
         }
 
-        // Not a simple integer case (range case etc.)
         return false;
     }
 
     return false;
 }
-
 // handle_switch_entry:
 // - seeds the case state
 // - ALWAYS pushes incoming state to ctx.state_stack[key] so restore works
@@ -6141,12 +6931,12 @@ static void handle_switch_entry(gimple* sw, basic_block bb, tree obj_address)
         }
     }
 
-    fprintf(stderr,
-        "Debug: SWITCH enter ifid=%d obj=%p bb=%d case=%s possible_count=%lu\n",
-        ifid, (void*)obj_address,
-        bb ? bb->index : -1,
-        is_default ? "default" : std::to_string(case_val).c_str(),
-        (unsigned long)possible.count());
+   // fprintf(stderr,
+     //   "Debug: SWITCH enter ifid=%d obj=%p bb=%d case=%s possible_count=%lu\n",
+     //   ifid, (void*)obj_address,
+     //   bb ? bb->index : -1,
+     //   is_default ? "default" : std::to_string(case_val).c_str(),
+     //   (unsigned long)possible.count());
 }
 
 
@@ -6285,11 +7075,25 @@ static void finalize_switch_if_exited(tree obj_address, basic_block bb, location
     }
 }
 
+static bool is_first_real_stmt_in_bb(gimple* stmt) {
+    basic_block bb = gimple_bb(stmt);
+    if (!bb) return false;
+
+    for (gimple_stmt_iterator it = gsi_start_bb(bb); !gsi_end_p(it); gsi_next(&it)) {
+        gimple* s = gsi_stmt(it);
+        if (!s) continue;
+        if (is_gimple_debug(s)) continue;
+        if (gimple_code(s) == GIMPLE_NOP) continue;
+        return s == stmt;
+    }
+    return false;
+}
 
 // ------------------------------------------------------------
 // FULL process_callee_decl 
 // ------------------------------------------------------------
 void process_callee_decl(tree callee_decl, gimple* stmt) {
+    printf("Process\n");
     if (!callee_decl || !stmt) return;
     if (!is_gimple_call(stmt)) return;
 
@@ -6305,6 +7109,29 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
     std::string base_name = callee_name;
     if (auto pos = base_name.rfind("::"); pos != std::string::npos)
         base_name = base_name.substr(pos + 2);
+
+    // Helper: seed branch/switch state only once, at BB entry.
+    // IMPORTANT: ignore LABEL/PREDICT too, otherwise switch case blocks
+    // often fail to count as "entry".
+    auto is_first_real_stmt_in_bb = [&](gimple* s) -> bool {
+        basic_block bb = gimple_bb(s);
+        if (!bb) return false;
+
+        for (gimple_stmt_iterator it = gsi_start_bb(bb); !gsi_end_p(it); gsi_next(&it)) {
+            gimple* cur = gsi_stmt(it);
+            if (!cur) continue;
+
+            enum gimple_code code = gimple_code(cur);
+
+            if (is_gimple_debug(cur)) continue;
+            if (code == GIMPLE_NOP) continue;
+            if (code == GIMPLE_LABEL) continue;
+            if (code == GIMPLE_PREDICT) continue;
+
+            return cur == s;
+        }
+        return false;
+    };
 
     // ==================================================
     // (A) inter-proc "dive"
@@ -6412,6 +7239,7 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
         basic_block bb = gimple_bb(stmt);
         gimple_stmt_iterator tail = gsi_last_bb(bb);
         gimple* term = gsi_end_p(tail) ? nullptr : gsi_stmt(tail);
+        bool at_bb_entry = is_first_real_stmt_in_bb(stmt);
 
         // --------------------------
         // DEBUG: print every call encountered
@@ -6420,12 +7248,17 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
             int st = 0;
             auto itS = state_manager.object_states.find(obj_address);
             if (itS != state_manager.object_states.end()) st = itS->second;
-            printf("\n[CALL] bb=%d term=%d callee=%s obj=%p state=%d\n",
+         /**   printf("\n[CALL] bb=%d term=%d callee=%s obj=%p state=%d\n",
                    bb ? bb->index : -1,
                    term ? (int)gimple_code(term) : -1,
                    callee_name.c_str(),
                    (void*)obj_address,
                    st);
+            printf("[BB-ENTRY] bb=%d stmt_code=%d callee=%s at_bb_entry=%d\n",
+                   bb ? bb->index : -1,
+                   (int)gimple_code(stmt),
+                   callee_name.c_str(),
+                   (int)at_bb_entry);*/
         }
 
         // Helper: extract integer constant K from a GIMPLE_COND (either side).
@@ -6447,86 +7280,19 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
             return getK(lhs) || getK(rhs);
         };
 
-        // Helper: synthesize ctx.arm_sets for IF that is part of else-if chain
-        // using last_guard (pre-state + method) and cond constant K.
-        auto synthesize_if_arm_sets_from_last_guard = [&](BranchCtx& ctx, tree key, gimple* cond_term) -> bool {
-            int pre = -1;
-            std::string meth;
-            if (!load_last_guard(obj_address, pre, meth)) {
-                printf("           [SYNTH] load_last_guard FAILED\n");
-                return false;
-            }
-            if (pre < 0 || meth.empty()) {
-                printf("           [SYNTH] last_guard invalid pre=%d meth='%s'\n", pre, meth.c_str());
-                return false;
-            }
-
-            int K = 0;
-            if (!extract_int_const_from_cond(cond_term, K)) {
-                printf("           [SYNTH] could not extract const K from cond\n");
-                return false;
-            }
-
-            // candidates from pre under the guard method
-            std::vector<int> candidates = transitions_for(pre, meth, gimple_location(cond_term));
-
-            // map for (pre, meth, K) -> mapped state (true arm)
-            int mapped = branch_next_for_cond(pre, meth, K);
-
-            ArmChoiceSet sets;
-            sets.tset.reset();
-            sets.fset.reset();
-
-            auto set_all_candidates = [&](Bitset& out) {
-                for (int s : candidates)
-                    if (0 <= s && s < (int)out.size()) out.set(s);
-            };
-
-            if (mapped >= 0 && mapped < (int)sets.tset.size()) {
-                sets.tset.set(mapped);
-            } else {
-                // if mapping fails, be conservative: true arm could be any candidate
-                set_all_candidates(sets.tset);
-                printf("           [SYNTH] mapping FAILED for K=%d; using conservative tset\n", K);
-            }
-
-            // false arm: all candidates except mapped (or all if mapped invalid)
-            if (mapped >= 0) {
-                for (int s : candidates) {
-                    if (s < 0 || s >= (int)sets.fset.size()) continue;
-                    if (s == mapped) continue;
-                    sets.fset.set(s);
-                }
-                // if mapped was the only candidate, keep false as mapped (avoid empty)
-                if (sets.fset.count() == 0 && sets.tset.count() == 1) sets.fset = sets.tset;
-            } else {
-                set_all_candidates(sets.fset);
-            }
-
-            // install in this ctx (ifid)
-            ctx.arm_sets[key] = sets;
-
-            // also update ctx guard origin for debugging clarity
-            ctx.guard_pre_state = pre;
-            ctx.guard_method = meth;
-
-            printf("           [SYNTH] created arm_sets from last_guard: pre=%d meth=%s K=%d mapped=%d (t=%lu f=%lu)\n",
-                   pre, meth.c_str(), K, mapped,
-                   (unsigned long)sets.tset.count(),
-                   (unsigned long)sets.fset.count());
-            return true;
-        };
-
         // --------------------------
         // APPLY entry seed when entering under a controlling terminator
+        // IMPORTANT:
+        //   - only at basic-block entry
+        //   - never synthesize from stale last_guard
         // --------------------------
         {
             gimple* pred_term = controlling_terminator_of(bb);
 
             // ==========================
-            // IF ENTRY (FIXED)
+            // IF ENTRY (SAFE)
             // ==========================
-            if (pred_term && gimple_code(pred_term) == GIMPLE_COND) {
+            if (at_bb_entry && pred_term && gimple_code(pred_term) == GIMPLE_COND) {
                 int ifid = get_if_else_id_for_terminator(pred_term);
                 BranchCtx& ctx = ensure_ifctx(ifid, pred_term);
                 tree key = norm_obj_key(obj_address);
@@ -6537,51 +7303,40 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
 
                 int arm = arm_for_bb_under_cond(pred_term, bb);
 
-                printf("[ENTER IF] ifid=%d bb=%d arm=%d obj=%p key=%p state(before)=%d\n",
-                       ifid, bb ? bb->index : -1, arm,
-                       (void*)obj_address, (void*)key, st_before);
-
-                // If arm_sets missing (like your ifid=1 else-if), synthesize from last_guard + cond constant.
-                if (!ctx.arm_sets.count(key)) {
-                    printf("           arm_sets MISSING => trying SYNTH from last_guard\n");
-
-                    bool ok = synthesize_if_arm_sets_from_last_guard(ctx, key, pred_term);
-                    if (!ok) {
-                        printf("           [SYNTH] FAILED => cannot seed this IF\n");
-                    }
-                }
-
-                // If we have a guard pre-state (from PLAN or SYNTH), reset leaked state before seeding.
-                // This is the key to stop state 9 leaking into else-if.
-                if (ctx.guard_pre_state >= 0) {
-                    if (auto it = state_manager.object_states.find(obj_address);
-                        it != state_manager.object_states.end())
-                    {
-                        if (it->second != ctx.guard_pre_state) {
-                            printf("           [RESET] state leak detected: %d -> pre=%d\n",
-                                   it->second, ctx.guard_pre_state);
-                            it->second = ctx.guard_pre_state;
-                        }
-                    } else {
-                        state_manager.object_states[obj_address] = ctx.guard_pre_state;
-                        printf("           [RESET] state init to pre=%d\n", ctx.guard_pre_state);
-                    }
-                }
+               // printf("[ENTER IF] ifid=%d bb=%d arm=%d obj=%p key=%p state(before)=%d\n",
+                 //      ifid, bb ? bb->index : -1, arm,
+                      // (void*)obj_address, (void*)key, st_before);
 
                 auto itSets = ctx.arm_sets.find(key);
-                if (itSets != ctx.arm_sets.end()) {
+                if (itSets == ctx.arm_sets.end()) {
+                    printf("           arm_sets MISSING => NO push/seed\n");
+                } else {
+                    // Reset only when this exact IF has a real arm-set for this object.
+                    if (ctx.guard_pre_state >= 0) {
+                        auto it = state_manager.object_states.find(obj_address);
+                        if (it != state_manager.object_states.end()) {
+                            if (it->second != ctx.guard_pre_state) {
+                                printf("           [RESET] state leak detected: %d -> pre=%d\n",
+                                       it->second, ctx.guard_pre_state);
+                                it->second = ctx.guard_pre_state;
+                            }
+                        } else {
+                            state_manager.object_states[obj_address] = ctx.guard_pre_state;
+                            printf("           [RESET] state init to pre=%d\n", ctx.guard_pre_state);
+                        }
+                    }
+
                     printf("           arm_sets FOUND (t=%lu f=%lu)\n",
                            (unsigned long)itSets->second.tset.count(),
                            (unsigned long)itSets->second.fset.count());
 
-                    // Always push incoming state for this arm (after reset).
                     int prev = 0;
                     auto itPrev = state_manager.object_states.find(obj_address);
                     if (itPrev != state_manager.object_states.end()) prev = itPrev->second;
                     ctx.state_stack[key].push_back(prev);
 
-                    printf("           pushed prev=%d stack_sz=%zu\n",
-                           prev, (size_t)ctx.state_stack[key].size());
+                   // printf("           pushed prev=%d stack_sz=%zu\n",
+                      //     prev, (size_t)ctx.state_stack[key].size());
 
                     Bitset possible; possible.reset();
                     if (arm == 1) possible = itSets->second.tset;
@@ -6590,14 +7345,14 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
                     ctx.active_set[key] = possible;
                     if (arm == 0) g_else_chain_cands[key] = possible;
 
-                    printf("           seeded candidates=%lu\n",
-                           (unsigned long)possible.count());
+                 //   printf("           seeded candidates=%lu\n",
+                   //        (unsigned long)possible.count());
 
                     if (possible.count() == 1) {
                         int s = first_set_bit(possible);
                         if (s >= 0) {
                             state_manager.object_states[obj_address] = s;
-                            printf("           new state=%d (singleton)\n", s);
+                        //    printf("           new state=%d (singleton)\n", s);
                         }
                     } else {
                         int now = 0;
@@ -6605,13 +7360,18 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
                         if (itNow != state_manager.object_states.end()) now = itNow->second;
                         printf("           state now=%d (non-singleton)\n", now);
                     }
-                } else {
-                    printf("           arm_sets still missing => NO push/seed\n");
                 }
             }
 
-            // SWITCH entry 
+            // ==========================
+            // SWITCH ENTRY (SAFE)
+            // ==========================
             if (pred_term && gimple_code(pred_term) == GIMPLE_SWITCH) {
+                //printf("[SW-ENTRY-CHECK] bb=%d at_bb_entry=%d obj=%p\n",
+                  //     bb ? bb->index : -1, (int)at_bb_entry, (void*)obj_address);
+            }
+
+            if (at_bb_entry && pred_term && gimple_code(pred_term) == GIMPLE_SWITCH) {
                 handle_switch_entry(pred_term, bb, obj_address);
             }
         }
@@ -6625,7 +7385,7 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
             state_manager.object_states[obj_address] = current_state;
 
         // --------------------------
-        // SWITCH PLAN 
+        // SWITCH PLAN
         // --------------------------
         if (term && gimple_code(term) == GIMPLE_SWITCH) {
             if (call_feeds_switch_index(stmt, term)) {
@@ -6655,9 +7415,9 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
                 ctx.sw_remaining[key]      = arms;
                 ctx.sw_remaining_init[key] = arms;
 
-                printf("[SW-PLAN] ifid=%d obj=%p pre=%d guard=%s arms=%d\n",
-                       ifid, (void*)obj_address, ctx.guard_pre_state,
-                       ctx.guard_method.c_str(), arms);
+              //  printf("[SW-PLAN] ifid=%d obj=%p pre=%d guard=%s arms=%d\n",
+                //       ifid, (void*)obj_address, ctx.guard_pre_state,
+                 //      ctx.guard_method.c_str(), arms);
 
                 save_last_guard(obj_address, ctx.guard_pre_state, ctx.guard_method,
                                 &ctx.remaining, ctx.remaining_init);
@@ -6667,12 +7427,12 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
         }
 
         // --------------------------
-        // IF PLAN 
+        // IF PLAN
         // --------------------------
         if (term && gimple_code(term) == GIMPLE_COND) {
             bool feeds = call_feeds_terminator_cond(stmt, term);
-            printf("[IF-PLAN-CHECK] bb=%d callee=%s feeds=%d current_state=%d\n",
-                   bb ? bb->index : -1, callee_name.c_str(), (int)feeds, current_state);
+          //  printf("[IF-PLAN-CHECK] bb=%d callee=%s feeds=%d current_state=%d\n",
+          //         bb ? bb->index : -1, callee_name.c_str(), (int)feeds, current_state);
 
             if (feeds) {
                 int ifid = get_if_else_id_for_terminator(term);
@@ -6681,8 +7441,8 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
                 ctx.guard_pre_state = current_state;
                 ctx.guard_method = callee_name;
 
-                printf("[PLAN] IF guard detected: ifid=%d method=%s pre_state=%d bb=%d\n",
-                       ifid, callee_name.c_str(), current_state, bb ? bb->index : -1);
+             //   printf("[PLAN] IF guard detected: ifid=%d method=%s pre_state=%d bb=%d\n",
+               //        ifid, callee_name.c_str(), current_state, bb ? bb->index : -1);
 
                 debug_print_condition(term, "PLAN", ifid);
 
@@ -6733,9 +7493,9 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
                             ctx.arm_sets[key] = sets;
                             g_else_chain_cands[key] = sets.fset;
 
-                            printf("           arm_sets created: tcnt=%lu fcnt=%lu\n",
-                                   (unsigned long)sets.tset.count(),
-                                   (unsigned long)sets.fset.count());
+                           // printf("           arm_sets created: tcnt=%lu fcnt=%lu\n",
+                            //       (unsigned long)sets.tset.count(),
+                              //     (unsigned long)sets.fset.count());
                         } else {
                             printf("           WARNING: branch_next_for_cond FAILED\n");
                         }
@@ -6768,12 +7528,12 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
                     auto itS = state_manager.object_states.find(obj_address);
                     if (itS != state_manager.object_states.end()) st = itS->second;
 
-                    printf("[TYPECHECK] ctl=%d bb=%d method=%s obj=%p state=%d\n",
-                           (int)gimple_code(ctl),
-                           bb ? bb->index : -1,
-                           callee_name.c_str(),
-                           (void*)obj_address,
-                           st);
+                   // printf("[TYPECHECK] ctl=%d bb=%d method=%s obj=%p state=%d\n",
+                      //     (int)gimple_code(ctl),
+                      //     bb ? bb->index : -1,
+                      //     callee_name.c_str(),
+                       //    (void*)obj_address,
+                       //    st);
 
                     state_manager.Typestate_Checking(obj_address, callee_name, gimple_location(stmt));
                     return;
@@ -6795,11 +7555,11 @@ void process_callee_decl(tree callee_decl, gimple* stmt) {
             auto itS = state_manager.object_states.find(obj_address);
             if (itS != state_manager.object_states.end()) st = itS->second;
 
-            printf("[TYPECHECK] (no-branch) bb=%d method=%s obj=%p state=%d\n",
-                   bb ? bb->index : -1,
-                   callee_name.c_str(),
-                   (void*)obj_address,
-                   st);
+           // printf("[TYPECHECK] (no-branch) bb=%d method=%s obj=%p state=%d\n",
+           //        bb ? bb->index : -1,
+           //        callee_name.c_str(),
+           //        (void*)obj_address,
+            //       st);
 
             state_manager.Typestate_Checking(obj_address, callee_name, gimple_location(stmt));
             return;
@@ -6911,8 +7671,6 @@ PARAMS:
         }
     }
 }
-
-
 
 /*******************************
  * GIMPLE Statement Analysis
@@ -7073,7 +7831,7 @@ if (g_mark_file) {
 
     // 3) If no flagged object is touched, nothing to do
     if (!flagged_obj) return;
-
+//printf("NOW Enter Checking\n:");
     // 4) Proceed with your existing static processing (no runtime)
     process_callee_decl(callee_decl, stmt);
 }
@@ -7088,7 +7846,7 @@ if (g_mark_file) {
 void Analyse_all_functions()
 {
 
-     
+     printf("Start main analysing: \n");
     // ── 1) Find and seed only 'main' 
     tree main_decl = nullptr;
     cgraph_node *cgn = nullptr;
@@ -7273,7 +8031,8 @@ register_callback(plugin_name, PLUGIN_START_UNIT,
              validate_wcet_vs_timed_rules();
           
            validate_logic_with_timed_rules();
-            print_timed_typestate_rules();
+       //     print_timed_typestate_rules();
+         
          //    print_typestate_rules();
         
             once = true;
