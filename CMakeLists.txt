@@ -21,7 +21,7 @@ endif()
 
 # Common (used by AVR/ARM7 )
 # 
-set(PLUGIN_SRC ${CMAKE_SOURCE_DIR}/src/Coconut.cpp)           # Coconut plugin source
+set(PLUGIN_SRC ${CMAKE_SOURCE_DIR}/src/TimedCoconut.cpp)           # Coconut plugin source
 set(AVR_APP    ${CMAKE_SOURCE_DIR}/FoodMixer/main.cpp)        # AVR/desktop app
 set(ARM7_APP   ${CMAKE_SOURCE_DIR}/FoodMixer/fmarm.cpp)       # ARM7 app
 set(ARM7_STARTUP ${CMAKE_SOURCE_DIR}/startup_arm7.S)          # ARM7 startup (ARM state)
