@@ -14,7 +14,7 @@ TimedCoconut checks three main properties:
 
 **Artefact URL:** ``
 
-Download the artefact from the URL above. If it is provided as a compressed archive, extract it first. Then change into the extracted artefact directory and follow the Docker-based instructions in this README. The supplied Docker image provides the toolchains and analysis dependencies used by the evaluation, reducing the amount of host-specific setup required.
+Download the artefact from the URL above. It is provided as a compressed file, extract it first. Then change into the extracted artefact directory and follow the Docker-based instructions in this README. The supplied Docker image provides the toolchains and analysis dependencies used by the evaluation, reducing the amount of host-specific setup required.
 
 For example:
 
@@ -28,7 +28,13 @@ or, for a `.tar.gz` archive:
 tar -xzf <artefact-file>.tar.gz
 ```
 
-After extraction, change into the artefact directory and continue with the **Getting Started Guide** below.
+After extraction, change into the artefact directory: 
+
+```bash
+cd TimedCoconut
+```
+
+and continue with the **Getting Started Guide** below.
 
 
 # Requirements
@@ -63,6 +69,7 @@ The main directories are:
 - `Expr/`: complexity and verification-time experiment scripts.
 - `cmake/`: target toolchain and linker configuration.
 - `ARM-Simulate/`: supplied AArch64/QEMU executables and CSV data used for the execution comparison.
+- `src/`: TimedCoconut source code
 
 The supplied Docker image is:
 
@@ -567,7 +574,8 @@ Restore the original call order:
    TC.Amber();// amber
     TC.Red(); // red
 ```
-then rebuild
+then rebuild:
+
 ```bash
 cmake --build build-avr   --target trafficlight_avr_twopass   -- -j1
 ```
@@ -895,7 +903,7 @@ AVR:
 [trace] t_8=5.73 ms --End()--> t_9=5.73 ms [state 10 -> 1]
 ```
 
-## Claim 5 — Verification Overhead
+## Claim 5 — Verification Analysis
 
 The supplied experiment scripts measure source-level complexity and clean verification/compilation time for all five case studies on both targets. A clean build is used so that each timing measurement includes the intended verification workflow rather than reusing stale build products.
 
@@ -916,18 +924,16 @@ For the full experiment reported in the paper:
 
 The generated complexity files report non-comment lines of code (NLOC), token count, and cyclomatic complexity. The compile-time files report each individual measurement together with the average and standard deviation, which makes it possible to compare both typical cost and run-to-run variation.
 
-A Docker run may produce different absolute times from those reported in the paper because compilation and verification time depend on the host machine and execution environment. The reproducible objective is therefore to run all case studies under one consistent environment and compare the verification cost across the benchmark suite. Exact numerical agreement should not be expected when the underlying hardware or execution environment differs from the one used for the paper.
+A Docker run may produce different absolute times from those reported in the paper because compilation and verification time depend on the host machine and execution environment. The reproducible objective is therefore to run all case studies under one consistent environment and compare the verification cost across the benchmark suite. 
 
 ---
 
 
 # Hardware-Dependent Results
-
-The paper also reports execution and timing measurements collected on physical target hardware. These measurements are distinct from the static WCET analysis performed during the standard verification workflow.
-
-Reproducing those hardware measurements requires access to the corresponding devices and is separate from the standard Docker-based verification workflow described above.
-
-The ARM experiments reported in the paper were performed on the BeagleBone Black (BBB), using the stated ARM platform and a PREEMPT-RT Linux kernel for low-latency execution. The AVR experiments were performed on an Arduino Mega 2560 board based on the ATmega2560 8-bit AVR microcontroller.
+The hardware-dependent results reported in the paper are not directly supported as reproducible claims by the standard artefact evaluation, because reproducing these measurements requires access to the corresponding physical target hardware.
+The standard artefact workflow focuses on the claims that can be evaluated using the supplied Docker environment, including behavioural verification, timing analysis, WCET annotation, architecture-aware verification, and verification overhead.
+The paper additionally reports execution-time and timing measurements collected on physical hardware. The ARM experiments were performed on a BeagleBone Black (BBB), while the AVR experiments were performed on an Arduino Mega 2560 based on the ATmega2560 microcontroller. Reproducing these measurements therefore requires access to the corresponding devices and is outside the standard Docker-based artefact evaluation.
+For completeness, the artefact includes the generated AVR binaries and a separate AArch64/QEMU-based execution comparison. These materials allow reviewers to inspect or reproduce parts of the execution workflow without physical hardware; however, the QEMU results should not be interpreted as reproducing the physical hardware measurements reported in the paper.
 
 
 ## AVR
@@ -943,7 +949,7 @@ The artefact generates and verifies ARM7 target binaries using the ARM7 toolchai
 
 Physical ARM hardware is required to reproduce the hardware execution-time measurements reported for the physical platform.
 
-For reviewers who do not have the physical ARM platform, the artefact also provides a separate AArch64/QEMU execution package for comparing the supplied benchmark executables and CSV data. This simulation section is provided for execution comparison and should not be confused with the ARM7 target used by the TimedCoconut WCET-verification build above.
+For simualting the physical ARM platform, the artefact also provides a separate AArch64/QEMU execution package for comparing the supplied benchmark executables and CSV data. This simulation section is provided for execution comparison and should not be confused with the ARM7 target used by the TimedCoconut WCET-verification build above.
 
 ## Run All Five Supplied AArch64/QEMU Benchmarks
 
