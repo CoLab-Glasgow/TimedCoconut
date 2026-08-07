@@ -1008,6 +1008,12 @@ When the evaluation is complete, exit the container:
 ```bash
 exit
 ```
-# Adoptions and extensions of the artifact
+# Future Extensions of the Artefact
+
+1. **Support for hybrid timing behaviour:** **Support for hybrid timing behaviour:** TimedCoconut could be extended to support hybrid timing behaviour in which some timing parameters are defined statically, while others are determined at runtime. For example, a delay, timeout, period, or response time of a process, or the outcome of a previous computation. This would allow subsequent timing decisions to reflect the actual execution behaviour of the system rather than relying only on values fixed before execution.
+
+2. **Support for additional hardware platforms:** TimedCoconut could be extended beyond ARM and AVR to other architectures, such as RISC-V. This would enable the approach to be applied across a broader range of embedded processors.
+
+3. **Support for more complex application scenarios:** TimedCoconut could be extended to applications containing several interacting and communication-timed components, allowing the approach to be explored in systems where multiple events and timing constraints must be coordinated.
 
 
