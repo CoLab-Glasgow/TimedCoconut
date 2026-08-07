@@ -411,7 +411,7 @@ cd /workspace/Expr
 python3 plot.py
 ```
 
-This reproduces the type of comparison shown in Figure 4 of the paper. The absolute compile times may differ from the paper because the artefact workflow runs inside Docker, whereas the reported measurements were collected directly on the host environment used for the paper. The comparison should therefore be interpreted primarily in terms of the observed trends across case studies and targets rather than as an expectation of identical absolute timings. Here it show AVR is higher and more complex case studied need more time to analyse and compile. Example output is shown below:
+This reproduces the type of comparison shown in Figure 4 of the paper. The absolute compile times may differ from the paper because the artefact workflow runs inside Docker, whereas the reported measurements were collected directly on the host environment used for the paper. The comparison should therefore be interpreted primarily in terms of the observed trends across case studies and targets rather than as an expectation of identical absolute timings. In general, it shows AVR is higher than ARM and more complex case studies need more time to analyse and compile. Example output is shown below:
 
 ```
 Data loaded from CSV files:
@@ -529,12 +529,13 @@ cmake --build build-arm7 \
 
 ### Expected valid result
 
-The timing-specification error should disappear and the normal two-pass build should complete successfully.
+The timing-specification error should disappear, and the normal two-pass build should complete successfully.
 
 ## Claim 2 — Behavioural Verification (Sec 4)
 
 TimedCoconut tracks the current typestate and checks each method call against the transitions permitted from that state. A method call can therefore be rejected even when the method itself exists, if that call is not valid from the current protocol state.
-for example avr build with:
+for example, in AVR, first build with:
+
 ``` bash
 cmake --build build-avr   --target trafficlight_avr_twopass   -- -j1
 ```
@@ -564,7 +565,7 @@ cmake --build build-avr   --target trafficlight_avr_twopass   -- -j1
 
 ### Expected invalid result
 
-TimedCoconut report a behavioural/typestate error and the build fail. 
+TimedCoconut report a behavioural/typestate error, and the build fails. 
 
 
 Restore the original call order:
@@ -574,7 +575,7 @@ Restore the original call order:
    TC.Amber();// amber
     TC.Red(); // red
 ```
-then rebuild:
+Then rebuild:
 
 ```bash
 cmake --build build-avr   --target trafficlight_avr_twopass   -- -j1
@@ -584,7 +585,7 @@ cmake --build build-avr   --target trafficlight_avr_twopass   -- -j1
 
 ### Expected valid result
 
-The behavioural error should disappear and the build should again report:
+The behavioural error should disappear, and the build should again report:
 
 ```text
 ✓ All behaviour checks passed
@@ -940,7 +941,7 @@ For completeness, the artefact includes the generated AVR binaries and a separat
 
 The AVR build generates verified ELF and HEX files for the ATmega2560.
 
-A reviewer with an Arduino Mega 2560 board can use the supplied flashing commands in the `AVR-Haresware-run` directory to deploy the generated firmware and reproduce the hardware-dependent AVR measurements.
+A reviewer with an Arduino Mega 2560 board can use the supplied flashing commands in the `AVR-Hardware-run` directory to deploy the generated firmware and reproduce the hardware-dependent AVR measurements.
 
 
 ## ARM
@@ -949,7 +950,7 @@ The artefact generates and verifies ARM7 target binaries using the ARM7 toolchai
 
 Physical ARM hardware is required to reproduce the hardware execution-time measurements reported for the physical platform.
 
-For simualting the physical ARM platform, the artefact also provides a separate AArch64/QEMU execution package for comparing the supplied benchmark executables and CSV data. This simulation section is provided for execution comparison and should not be confused with the ARM7 target used by the TimedCoconut WCET-verification build above.
+For simulating the physical ARM platform, the artefact also provides a separate AArch64/QEMU execution package for comparing the supplied benchmark executables and CSV data. This simulation section is provided for comparison of execution and should not be confused with the ARM7 target used by the TimedCoconut WCET-verification build above.
 
 ## Run All Five Supplied AArch64/QEMU Benchmarks
 
@@ -1000,10 +1001,13 @@ Each benchmark directory contains the corresponding CSV data used for the execut
 - `summary.csv` — summary values derived from the experiment data.
 
 
-# Exit
+## Exit
 
 When the evaluation is complete, exit the container:
 
 ```bash
 exit
 ```
+# Adoptions and extensions of the artifact
+
+
