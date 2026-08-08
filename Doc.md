@@ -939,7 +939,7 @@ A Docker run may produce different absolute times from those reported in the pap
 
 
 # Hardware-Dependent Results
-The hardware-dependent results reported in the paper are not directly supported as reproducible claims by the standard artefact evaluation, because reproducing these measurements requires access to the corresponding physical target hardware.
+The hardware-dependent results reported in the paper are not directly supported as reproducible claims by the standard artefact evaluation, because reproducing these measurements **requires access to the corresponding physical target hardware**.
 The standard artefact workflow focuses on the claims that can be evaluated using the supplied Docker environment, including behavioural verification, timing analysis, WCET annotation, architecture-aware verification, and verification overhead.
 The paper additionally reports execution-time and timing measurements collected on physical hardware. The ARM experiments were performed on a BeagleBone Black (BBB), while the AVR experiments were performed on an Arduino Mega 2560 based on the ATmega2560 microcontroller. Reproducing these measurements therefore requires access to the corresponding devices and is outside the standard Docker-based artefact evaluation.
 For completeness, the artefact includes the generated AVR binaries and a separate AArch64/QEMU-based execution comparison. These materials allow reviewers to inspect or reproduce parts of the execution workflow without physical hardware; however, the QEMU results should not be interpreted as reproducing the physical hardware measurements reported in the paper.
@@ -949,7 +949,8 @@ For completeness, the artefact includes the generated AVR binaries and a separat
 
 The AVR build generates verified ELF and HEX files for the ATmega2560.
 
-A reviewer with an Arduino Mega 2560 board can use the supplied flashing commands in the `AVR-Hardware-run` directory to deploy the generated firmware and reproduce the hardware-dependent AVR measurements.
+If an Arduino Mega 2560 board is available, you can use the supplied flashing commands in the `AVR-Hardware-run` directory to deploy the generated firmware and reproduce the hardware-dependent AVR measurements.
+
 
 
 ## ARM
