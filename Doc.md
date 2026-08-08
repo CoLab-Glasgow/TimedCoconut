@@ -124,7 +124,7 @@ VS Code is optional and can be downloaded from:
 https://code.visualstudio.com/
 ```
 
-Check that Docker is installed and available from the terminal:
+Open Docker and keep it running while using the artefact. Then verify that Docker is installed and accessible from the terminal: 
 
 ```bash
 docker --version
