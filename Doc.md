@@ -20,6 +20,10 @@ md5:ce95937837af730d7e009a5c27488fd1
 `
 MD5 (ProgrammingAE.zip) = `ce95937837af730d7e009a5c27488fd1`
 
+
+The article is inside this folder.
+
+
 Download the artefact from the URL above. It is provided as a compressed file, extract it first. Then change into the extracted artefact directory and follow the Docker-based instructions in this README. The supplied Docker image provides the toolchains and analysis dependencies used by the evaluation, reducing the amount of host-specific setup required.
 
 For example:
