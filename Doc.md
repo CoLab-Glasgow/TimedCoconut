@@ -933,7 +933,7 @@ python3 plot.py
 
 The generated complexity files report non-comment lines of code (NLOC), token count, and cyclomatic complexity. The compile-time files report each individual measurement together with the average and standard deviation, which makes it possible to compare both typical cost and run-to-run variation.
 
-A Docker run may produce different absolute times from those reported in the paper because compilation and verification time depend on the host machine and execution environment. The reproducible objective is therefore to run all case studies under one consistent environment and compare the verification cost across the benchmark suite. 
+A Docker run may produce different absolute times from those reported in the paper because compilation and verification time depend on the host machine and execution environment. In general, it shows AVR is higher than ARM and more complex case studies need more time to analyse and compile.
 
 ---
 
