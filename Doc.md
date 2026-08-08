@@ -55,7 +55,6 @@ Required on the host machine:
 
 - **Docker Desktop or Docker Engine:** https://www.docker.com/get-started/
 - **Network connection:** required to download/install Docker, VS Code, or any missing host dependencies. Once the supplied Docker image has been loaded, most artefact steps can be run offline.
-- **A terminal**
 - **Sufficient disk space** to load and run the Docker image
 
 Optional:
