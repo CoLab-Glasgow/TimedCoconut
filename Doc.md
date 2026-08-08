@@ -91,7 +91,7 @@ timedcoconut:1.3
 
 TimedCoconut is target-sensitive: the WCET values and the final timing-verification result depend on the architecture and build configuration used to generate the binary. Therefore, WCET values should be interpreted together with the target, clock configuration, compiler, and analysis settings under which they were produced.
 
-The benchmark suite contains both illustrative examples and case studies adapted from existing software systems. The Pillbox, Robot, and Drone case studies are adapted from developed systems rather than being created specifically for TimedCoconut. Their application logic is preserved across the ARM and AVR variants; only target-specific implementation details, such as delay or wait routines, are changed where required by the architecture.
+The benchmark suite contains both illustrative examples and case studies adapted from existing software systems. The Pillbox, Robot, and Drone case studies are adapted from real systems and not developed by TimedCoconut authors. Their application logic is preserved across the ARM and AVR variants; only target-specific implementation details, such as delay or wait routines, are changed where required by the architecture.
 
 The artefact contains two verification targets:
 
