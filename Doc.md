@@ -511,7 +511,7 @@ cmake --build build-arm7 \
 
 ### Expected invalid result
 
-The build should stop with a compile-time error such as:
+The build should stop with a compile-time error:
 ```
 error: static assertion failed: TimeGuard: lower(duration) must be <= upper(duration)
   143 |   static_assert(!(has_lower && has_upper) || (lower <= upper),
@@ -542,8 +542,7 @@ The timing-specification error should disappear, and the normal two-pass build s
 
 ## Claim 2 — Behavioural Verification (Sec 4)
 
-TimedCoconut tracks the current typestate and checks each method call against the transitions permitted from that state. A method call can therefore be rejected even when the method itself exists, if that call is not valid from the current protocol state.
-for example, in AVR, first build with:
+TimedCoconut tracks the current typestate and checks each method call against the transitions permitted from that state. A method call can therefore be rejected even when the method itself exists, if that call is not valid from the current protocol state. For example, in AVR, first build with:
 
 ``` bash
 cmake --build build-avr   --target trafficlight_avr_twopass   -- -j1
@@ -574,7 +573,7 @@ cmake --build build-avr   --target trafficlight_avr_twopass   -- -j1
 
 ### Expected invalid result
 
-TimedCoconut report a behavioural/typestate error, and the build fails. 
+TimedCoconut **reports a behavioural/typestate error**, and the build fails. 
 
 
 Restore the original call order:
