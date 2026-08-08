@@ -448,7 +448,7 @@ The artefact provides reproducible checks for the following claims:
 
 4. Two-pass architecture-aware verification: TimedCoconut performs target-specific WCET analysis and annotation in the first pass, then rebuilds the annotated source in the second pass to verify the timing contracts against the analysed WCET values.
 
-5. Verification overhead analysis: The experiment measures verification and target-specific compilation time across the five case studies and both target configurations.
+5. Verification analysis: The experiment measures verification and target-specific compilation time across the five case studies and both target configurations.
 
 ## Step-by-Step Instructions for Checking the Claims
 
