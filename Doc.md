@@ -925,7 +925,7 @@ cd /workspace/Expr
 python3 plot.py
 ```
 
-For the full experiment reported in the paper:
+**Optional:** For the full experiment reported in the paper (approximately 35 minutes):
 
 ```bash
 ./run_all_compile_tests.sh 100
