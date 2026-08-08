@@ -12,20 +12,26 @@ TimedCoconut checks three main properties:
 3. **Architecture-aware validation** — WCET analysis and the final timing checks are performed for the selected target architecture. This is important because the same source-level operation can have different execution-time bounds on different processors or build configurations.
 
 
-**Artefact URL:** ``
+**Artefact URL:** `https://doi.org/10.5281/zenodo.21843134`
+
+Hash certifying the version of the artefact at the time of submission:
+`
+md5:ce95937837af730d7e009a5c27488fd1 
+`
+MD5 (ProgrammingAE.zip) = `ce95937837af730d7e009a5c27488fd1`
 
 Download the artefact from the URL above. It is provided as a compressed file, extract it first. Then change into the extracted artefact directory and follow the Docker-based instructions in this README. The supplied Docker image provides the toolchains and analysis dependencies used by the evaluation, reducing the amount of host-specific setup required.
 
 For example:
 
 ```bash
-unzip <artefact-file>.zip
+unzip ProgrammingAE.zip
 ```
 
 or, for a `.tar.gz` archive:
 
 ```bash
-tar -xzf <artefact-file>.tar.gz
+tar -xzf ProgrammingAE.tar.gz
 ```
 
 After extraction, change into the artefact directory: 
@@ -1015,5 +1021,3 @@ exit
 2. **Support for additional hardware platforms:** TimedCoconut could be extended beyond ARM and AVR to other architectures, such as RISC-V. This would enable the approach to be applied across a broader range of embedded processors.
 
 3. **Support for more complex application scenarios:** TimedCoconut could be extended to applications containing several interacting and communication-timed components, allowing the approach to be explored in systems where multiple events and timing constraints must be coordinated.
-
-
